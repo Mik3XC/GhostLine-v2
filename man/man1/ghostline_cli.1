@@ -1,9 +1,9 @@
-.Dd March 27, 2026
+.Dd April 5, 2026
 .Dt GHOSTLINE_CLI 1
 .Os
 .Sh NAME
 .Nm ghostline_cli
-.Nd transport-first TCP relay with candidate mutation, rules loading, PID discovery, and JSONL audit streams
+.Nd transport-first interception relay with candidate mutation, rules loading, target discovery, and operator review workflows
 .Sh SYNOPSIS
 .Nm
 .Ar listen_port upstream_host upstream_port
@@ -12,24 +12,53 @@
 .Fl -search-pid Ar term
 .Op search options
 .Nm
-.Fl -help-rules | -help-search | -help-examples | -help-cheatsheet
+.Fl -review-list
+.Op review options
+.Nm
+.Fl -help-rules | -help-search | -help-profiles | -help-review | -help-examples | -help-cheatsheet
 .Sh DESCRIPTION
 .Nm
-is a macOS-first TCP relay for observing traffic, staging mutation candidates, and preserving original delivery when mutation safety is not provable.
-It supports:
+is the Ghostline Phase 1 command-line operator surface.
+It relays TCP traffic, stages mutation candidates, validates modified output before release, and falls back to original delivery when mutation safety is not provable.
+.Pp
+Ghostline is built around one operating rule:
+.Dq original delivery wins unless modified release is proven safe .
+.Pp
+The CLI supports:
 .Bl -bullet
 .It
 raw live mutation
 .It
 byte-window mutation
 .It
-MQTT framing and PUBLISH mutation
+MQTT framing and
+.Dq PUBLISH
+mutation
 .It
-rules-driven configuration
+rules-driven configuration via JSON, Jinja-style JSON, and lightweight HCL/Terraform-style files
 .It
-PID search for target discovery
+PID and port discovery for target selection
 .It
-human-readable and JSONL audit streams
+saved target profiles
+.It
+pending review queue operations
+.It
+human-readable and JSONL audit and action streams
+.El
+.Sh OPERATING MODEL
+Ghostline is transport-first rather than protocol-first.
+It keeps original delivery available while plugins attempt framing or mutation.
+Modified bytes are released only after validation succeeds.
+When mutation fails or becomes structurally unsafe, Ghostline releases the untouched original bytes and may create an operator review item instead of forcing the modified path.
+.Pp
+Current protocol reality:
+.Bl -bullet
+.It
+MQTT is the only protocol-owned framing and active mutation plugin.
+.It
+raw-live and byte-window cover unknown traffic and operator-defined boundaries.
+.It
+RabbitMQ, AMQP, ActiveMQ, Azure Service Bus, and Kafka are compiled-in detection and audit targets today.
 .El
 .Sh CORE OPTIONS
 .Bl -tag -width "--mqtt-review-threshold"
@@ -38,7 +67,7 @@ Start marker for the byte-window plugin.
 .It Fl -end-hex Ar hex
 End marker for the byte-window plugin.
 .It Fl -replace-text Ar text
-Replacement body for matched windows.
+Replacement body for matched windows or payloads.
 .It Fl -raw-find-text Ar text
 Find text for raw live mutation.
 .It Fl -raw-live
@@ -54,9 +83,9 @@ Create review/action items for MQTT mutations at or above this payload size.
 .It Fl -byte-review-threshold Ar n
 Create review/action items for byte-window mutations at or above this payload size.
 .It Fl -rewrite-u32-prefix
-Rewrite a leading 4-byte big-endian body size.
+Rewrite a leading 4-byte big-endian body size when applicable.
 .It Fl -max-plugin-buffer Ar n
-Maximum bytes a protocol plugin may hold before fallback.
+Maximum bytes a protocol plugin may hold before fallback-to-original behavior is triggered.
 .It Fl -protocol-hint Ar name
 Prefer a compiled-in plugin:
 .Dq mqtt ,
@@ -77,7 +106,7 @@ Load external control rules from JSON, Jinja-style JSON, or a lightweight HCL/Te
 Template variable used when rendering Jinja-style rules.
 .El
 .Pp
-Supported rule keys include:
+Common rule keys include:
 .Bl -bullet
 .It
 listen_port, upstream_host, upstream_port
@@ -93,6 +122,8 @@ raw_review_threshold_bytes, mqtt_review_threshold_bytes
 byte_window_review_threshold_bytes, max_plugin_buffer_bytes
 .It
 audit_log_path, action_log_path, audit_json_path, action_json_path
+.It
+review_queue_dir
 .El
 .Sh SEARCH OPTIONS
 .Bl -tag -width "--established-only"
@@ -101,7 +132,7 @@ Search running TCP processes by command substring or PID.
 .It Fl -search-port Ar port
 Filter search results by local or remote TCP port.
 .It Fl -search-state Ar state
-Filter search results by TCP state such as
+Filter results by TCP state such as
 .Dq LISTEN
 or
 .Dq ESTABLISHED .
@@ -112,6 +143,44 @@ Restrict results to listening sockets.
 .It Fl -established-only
 Restrict results to established sockets.
 .El
+.Pp
+PID discovery is a targeting feature.
+It does not turn PID identity into the transport routing primitive.
+.Sh PROFILE OPTIONS
+.Bl -tag -width "--seed-target-profiles"
+.It Fl -save-target-profile Ar path
+Write a target profile to disk.
+.It Fl -target-label Ar label
+Label used when saving a target profile.
+.It Fl -load-target-profile Ar path
+Load a saved target profile into search mode.
+.It Fl -show-target-profile Ar path
+Print a saved target profile.
+.It Fl -list-target-profiles Ar dir
+List saved target profile files.
+.It Fl -seed-target-profiles Ar dir
+Write ready-to-use protocol target profiles for MQTT, RMQ, AMQP, ActiveMQ, Azure Service Bus, and Kafka.
+.El
+.Sh REVIEW OPTIONS
+.Bl -tag -width "--review-replay"
+.It Fl -review-list
+List pending and saved review items.
+.It Fl -review-approve Ar action_id
+Mark a review item approved.
+.It Fl -review-reject Ar action_id
+Mark a review item rejected.
+.It Fl -review-replay Ar action_id
+Create a replay artifact from a blocked or saved mutation review.
+.It Fl -review-note Ar text
+Decision note for approve, reject, or replay operations.
+.It Fl -review-queue-dir Ar dir
+Directory containing saved review items.
+.It Fl -replay-dir Ar dir
+Directory where replay artifacts are written.
+.El
+.Pp
+Replay currently creates an operator artifact for follow-up.
+It does not inject traffic back into a live flow.
 .Sh OUTPUT OPTIONS
 .Bl -tag -width "--actions-json"
 .It Fl -audit-log Ar path
@@ -123,6 +192,8 @@ Write text action items to the given file.
 .It Fl -actions-json Ar path
 Write action items as JSONL.
 .El
+.Pp
+JSONL outputs are the recommended bridge for Python or Lua adapters because they avoid scraping human-readable logs.
 .Sh EXAMPLES
 .Bl -bullet
 .It
@@ -136,6 +207,11 @@ Search for listeners on MQTT port 1883:
 ghostline_cli --search-port 1883 --listen-only
 .Ed
 .It
+Seed protocol target profiles:
+.Bd -literal -offset indent
+ghostline_cli --seed-target-profiles ghostline_target_profiles
+.Ed
+.It
 Run raw live mutation:
 .Bd -literal -offset indent
 ghostline_cli 7777 127.0.0.1 8888 \e
@@ -143,7 +219,8 @@ ghostline_cli 7777 127.0.0.1 8888 \e
   --raw-live \e
   --raw-find-text hello \e
   --replace-text patch \e
-  --mutate-direction c2s
+  --mutate-direction c2s \e
+  --raw-review-threshold 8
 .Ed
 .It
 Run MQTT mutation:
@@ -151,6 +228,7 @@ Run MQTT mutation:
 ghostline_cli 7777 127.0.0.1 1883 \e
   --protocol-hint mqtt \e
   --replace-text patched-payload \e
+  --mutate-direction c2s \e
   --mqtt-review-threshold 8
 .Ed
 .It
@@ -159,7 +237,47 @@ Run from JSON rules:
 ghostline_cli 7777 127.0.0.1 8888 \e
   --rules examples/rules/raw-live.json
 .Ed
+.It
+Emit JSONL audit and action streams:
+.Bd -literal -offset indent
+ghostline_cli 7777 127.0.0.1 8888 \e
+  --rules examples/rules/raw-live.json \e
+  --audit-json ghostline_audit.jsonl \e
+  --actions-json ghostline_actions.jsonl
+.Ed
+.It
+Work the review queue:
+.Bd -literal -offset indent
+ghostline_cli --review-list
+ghostline_cli --review-approve action-1-3 --review-note approved
+ghostline_cli --review-replay action-1-3 --review-note replay-now
+.Ed
 .El
+.Sh FILES
+.Bl -bullet
+.It
+.Pa ghostline_audit.log
+default text audit output
+.It
+.Pa ghostline_actions.log
+default text action output
+.It
+.Pa ghostline_review_queue/
+saved review items
+.It
+.Pa ghostline_replays/
+replay artifacts
+.It
+.Pa ghostline_target_profiles/
+saved and seeded target profiles
+.El
+.Sh QT OPERATOR APP
+When Qt6 Widgets is available and the Qt target is built, the companion app is:
+.Bd -literal -offset indent
+./build-local/ghostline_qt
+.Ed
+.Pp
+The Qt operator app currently supports target discovery, target profiles, review queue operations, and loading rules and JSONL files from disk.
 .Sh MAN PAGE
 To open this man page from the repository root:
 .Bd -literal -offset indent
