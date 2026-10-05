@@ -1,6 +1,7 @@
 #include "net/proxy.hpp"
 #include "ghostline/operator_state.hpp"
 #include "ghostline/pid_search.hpp"
+#include "ghostline/capture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -61,6 +62,37 @@ void print_core_options(std::ostream& out) {
         << "  --rewrite-u32-prefix    Rewrite the leading 4-byte big-endian body size\n"
         << "  --max-plugin-buffer <n> Max bytes a protocol plugin may hold before fallback\n"
         << "  --protocol-hint <name>  Prefer a compiled-in plugin\n";
+    out << "  --observe-only          Capture and audit; never release a modified candidate\n"
+        << "  --trace-text <text>     Detect an exact byte trace across TCP read boundaries\n"
+        << "  --trace-hex <hex>       Detect an exact hexadecimal byte trace\n"
+        << "  --trace-direction <v>  Trace direction: c2s, s2c, or both\n"
+        << "  --cut-on-trace         Close both flow directions after a trace match\n"
+        << "  --listen-host <host>    Explicit local bind address\n"
+        << "  --listen-port <port>    Explicit local TCP port (also TCP-to-serial ingress)\n"
+        << "  --upstream-host <host>  Explicit upstream host without positional arguments\n"
+        << "  --upstream-port <port>  Explicit upstream port without positional arguments\n";
+}
+
+void print_capture_options(std::ostream& out) {
+    out << "  --capture <path>        Bounded GLCAP1 stream capture with summaries + payload hex\n"
+        << "  --capture-pcap <path>   Wireshark-readable DLT_USER0 PCAP payload capture\n"
+        << "  --capture-hex           Print micro-Wireshark hex/ASCII rows in the terminal\n"
+        << "  --capture-max-bytes <n> Hard payload-byte ceiling (default 4194304)\n"
+        << "  --capture-snaplen <n>   Maximum bytes retained per stream read (default 1024)\n"
+        << "  --expect-connack        Decode and label an MQTT server CONNACK\n"
+        << "  --read-capture <path>   Render a GLCAP1 file as terminal hex/ASCII\n"
+        << "  --capture-tail <n>      With --read-capture, show the last n records\n";
+}
+
+void print_serial_options(std::ostream& out) {
+    out << "  --serial-device <path>  Upstream serial/COM endpoint\n"
+        << "  --serial-ingress <path> Optional ingress vCOM/PTY for a serial-to-serial relay\n"
+        << "  --baud <n>              Upstream baud (default 115200)\n"
+        << "  --ingress-baud <n>      Ingress vCOM/PTY baud (default 115200)\n"
+        << "  --data-bits <7|8>       Serial data bits\n"
+        << "  --stop-bits <1|2>       Serial stop bits\n"
+        << "  --parity <none|even|odd> Serial parity\n"
+        << "  --flow-control <value>  none, hardware, or xonxoff\n";
 }
 
 void print_rules_options(std::ostream& out) {
@@ -104,6 +136,8 @@ void print_profile_options(std::ostream& out) {
         << "  --load-target-profile <path>  Load a saved target profile into PID search mode\n"
         << "  --show-target-profile <path>  Print a saved target profile\n"
         << "  --list-target-profiles <dir>  List saved target profile files\n";
+    out << "  --run-target-profile <path>   Run TCP or serial settings stored in a profile\n"
+        << "  --save-runtime-profile <path> Save the current relay/capture settings as a profile\n";
 }
 
 void print_review_options(std::ostream& out) {
@@ -210,6 +244,10 @@ void print_usage(const char* argv0) {
     print_review_options(std::cerr);
     std::cerr << "Output Options:\n";
     print_output_options(std::cerr);
+    std::cerr << "Capture Options:\n";
+    print_capture_options(std::cerr);
+    std::cerr << "Serial / vCOM Options:\n";
+    print_serial_options(std::cerr);
     std::cerr << "\n" << kUsefulAnswers
               << "More help:\n"
               << "  " << argv0 << " --help-rules\n"
@@ -218,6 +256,59 @@ void print_usage(const char* argv0) {
               << "  " << argv0 << " --help-review\n"
               << "  " << argv0 << " --help-examples\n"
               << "  " << argv0 << " --help-cheatsheet\n";
+}
+
+void apply_target_profile(const TargetProfile& profile, ProxyConfig& config) {
+    config.listen_host = profile.listen_host;
+    if (profile.listen_port > 0 && profile.listen_port <= 65535) {
+        config.listen_port = static_cast<std::uint16_t>(profile.listen_port);
+    }
+    config.upstream_host = profile.upstream_host;
+    if (profile.upstream_port > 0 && profile.upstream_port <= 65535) {
+        config.upstream_port = static_cast<std::uint16_t>(profile.upstream_port);
+    }
+    config.serial_ingress_device = profile.serial_ingress_device;
+    config.serial_device = profile.serial_device;
+    config.ingress_baud = profile.ingress_baud;
+    config.baud = profile.baud;
+    config.data_bits = profile.data_bits;
+    config.stop_bits = profile.stop_bits;
+    config.parity = profile.parity;
+    config.flow_control = profile.flow_control;
+    config.protocol_hint = profile.protocol_hint;
+    config.observe_only = profile.observe_only;
+    config.expect_mqtt_connack = profile.expect_connack;
+    config.capture_path = profile.capture_path;
+    config.capture_pcap_path = profile.capture_pcap_path;
+    config.capture_max_bytes = profile.capture_max_bytes;
+    config.capture_snaplen = profile.capture_snaplen;
+}
+
+TargetProfile runtime_target_profile(const ProxyConfig& config, const std::string& label) {
+    TargetProfile profile;
+    profile.label = label;
+    profile.transport = !config.serial_ingress_device.empty() ? "serial-pair" :
+        !config.serial_device.empty() ? "tcp-serial" : "tcp";
+    profile.listen_host = config.listen_host;
+    profile.listen_port = config.listen_port;
+    profile.upstream_host = config.upstream_host;
+    profile.upstream_port = config.upstream_port;
+    profile.serial_ingress_device = config.serial_ingress_device;
+    profile.serial_device = config.serial_device;
+    profile.ingress_baud = config.ingress_baud;
+    profile.baud = config.baud;
+    profile.data_bits = config.data_bits;
+    profile.stop_bits = config.stop_bits;
+    profile.parity = config.parity;
+    profile.flow_control = config.flow_control;
+    profile.protocol_hint = config.protocol_hint;
+    profile.observe_only = config.observe_only;
+    profile.expect_connack = config.expect_mqtt_connack;
+    profile.capture_path = config.capture_path;
+    profile.capture_pcap_path = config.capture_pcap_path;
+    profile.capture_max_bytes = config.capture_max_bytes;
+    profile.capture_snaplen = config.capture_snaplen;
+    return profile;
 }
 
 void print_pid_matches(const std::vector<ProcessSocketEntry>& matches) {
@@ -323,11 +414,20 @@ int main(int argc, char** argv) {
     std::string rules_path;
     std::vector<std::string> rules_vars;
     std::vector<std::string> passthrough_args;
+    std::string run_target_profile_path;
+    std::string read_capture_path;
+    std::size_t capture_tail = 0;
     for (std::size_t i = 0; i < input_args.size(); ++i) {
         if (input_args[i] == "--rules" && i + 1 < input_args.size()) {
             rules_path = input_args[++i];
         } else if (input_args[i] == "--rules-var" && i + 1 < input_args.size()) {
             rules_vars.push_back(input_args[++i]);
+        } else if (input_args[i] == "--run-target-profile" && i + 1 < input_args.size()) {
+            run_target_profile_path = input_args[++i];
+        } else if (input_args[i] == "--read-capture" && i + 1 < input_args.size()) {
+            read_capture_path = input_args[++i];
+        } else if (input_args[i] == "--capture-tail" && i + 1 < input_args.size()) {
+            capture_tail = static_cast<std::size_t>(std::stoull(input_args[++i]));
         } else {
             passthrough_args.push_back(input_args[i]);
         }
@@ -341,7 +441,26 @@ int main(int argc, char** argv) {
         input_args = std::move(passthrough_args);
     }
 
+    if (!read_capture_path.empty()) {
+        std::string error;
+        if (!render_capture_file(read_capture_path, std::cout, capture_tail, &error)) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        return 0;
+    }
+
     ProxyConfig config;
+    bool runtime_profile_loaded = false;
+    if (!run_target_profile_path.empty()) {
+        try {
+            apply_target_profile(load_target_profile(run_target_profile_path), config);
+            runtime_profile_loaded = true;
+        } catch (const std::exception& error) {
+            std::cerr << "Profile error: " << error.what() << '\n';
+            return 2;
+        }
+    }
     bool search_mode = false;
     bool search_json = false;
     PidSearchQuery search_query;
@@ -357,7 +476,9 @@ int main(int argc, char** argv) {
     std::string review_replay_id;
     std::string review_note;
     std::string replay_dir = "ghostline_replays";
+    std::string save_runtime_profile_path;
     std::size_t positional_start = 0;
+    bool have_positionals = false;
 
     try {
         for (std::size_t i = 0; i < input_args.size(); ++i) {
@@ -409,6 +530,61 @@ int main(int argc, char** argv) {
             } else if (arg == "--established-only") {
                 search_mode = true;
                 search_query.established_only = true;
+            } else if (arg == "--observe-only") {
+                config.observe_only = true;
+            } else if (arg == "--trace-text" && i + 1 < input_args.size()) {
+                config.trace_text = input_args[++i];
+            } else if (arg == "--trace-hex" && i + 1 < input_args.size()) {
+                config.trace_hex = input_args[++i];
+            } else if (arg == "--cut-on-trace") {
+                config.cut_on_trace = true;
+            } else if (arg == "--trace-direction" && i + 1 < input_args.size()) {
+                const std::string value = input_args[++i];
+                config.trace_client_to_server = value == "c2s" || value == "both";
+                config.trace_server_to_client = value == "s2c" || value == "both";
+                if (!config.trace_client_to_server && !config.trace_server_to_client) {
+                    throw std::runtime_error("unknown trace direction: " + value);
+                }
+            } else if (arg == "--listen-host" && i + 1 < input_args.size()) {
+                config.listen_host = input_args[++i];
+            } else if (arg == "--listen-port" && i + 1 < input_args.size()) {
+                config.listen_port = to_u16(input_args[++i].c_str());
+            } else if (arg == "--upstream-host" && i + 1 < input_args.size()) {
+                config.upstream_host = input_args[++i];
+            } else if (arg == "--upstream-port" && i + 1 < input_args.size()) {
+                config.upstream_port = to_u16(input_args[++i].c_str());
+            } else if (arg == "--serial-device" && i + 1 < input_args.size()) {
+                config.serial_device = input_args[++i];
+                config.observe_only = true;
+            } else if (arg == "--serial-ingress" && i + 1 < input_args.size()) {
+                config.serial_ingress_device = input_args[++i];
+                config.observe_only = true;
+            } else if (arg == "--baud" && i + 1 < input_args.size()) {
+                config.baud = std::stoi(input_args[++i]);
+            } else if (arg == "--ingress-baud" && i + 1 < input_args.size()) {
+                config.ingress_baud = std::stoi(input_args[++i]);
+            } else if (arg == "--data-bits" && i + 1 < input_args.size()) {
+                config.data_bits = std::stoi(input_args[++i]);
+            } else if (arg == "--stop-bits" && i + 1 < input_args.size()) {
+                config.stop_bits = std::stoi(input_args[++i]);
+            } else if (arg == "--parity" && i + 1 < input_args.size()) {
+                config.parity = input_args[++i];
+            } else if (arg == "--flow-control" && i + 1 < input_args.size()) {
+                config.flow_control = input_args[++i];
+            } else if (arg == "--capture" && i + 1 < input_args.size()) {
+                config.capture_path = input_args[++i];
+            } else if (arg == "--capture-pcap" && i + 1 < input_args.size()) {
+                config.capture_pcap_path = input_args[++i];
+            } else if (arg == "--capture-hex") {
+                config.capture_hex = true;
+            } else if (arg == "--capture-max-bytes" && i + 1 < input_args.size()) {
+                config.capture_max_bytes = static_cast<std::size_t>(std::stoull(input_args[++i]));
+            } else if (arg == "--capture-snaplen" && i + 1 < input_args.size()) {
+                config.capture_snaplen = static_cast<std::size_t>(std::stoull(input_args[++i]));
+            } else if (arg == "--expect-connack") {
+                config.expect_mqtt_connack = true;
+            } else if (arg == "--save-runtime-profile" && i + 1 < input_args.size()) {
+                save_runtime_profile_path = input_args[++i];
             } else if (arg == "--start-hex" && i + 1 < input_args.size()) {
                 config.start_marker_hex = input_args[++i];
             } else if (arg == "--end-hex" && i + 1 < input_args.size()) {
@@ -459,6 +635,7 @@ int main(int argc, char** argv) {
                 config.review_queue_dir = input_args[++i];
             } else {
                 positional_start = i;
+                have_positionals = true;
                 break;
             }
         }
@@ -543,16 +720,22 @@ int main(int argc, char** argv) {
             return matches.empty() ? 1 : 0;
         }
 
-        if (input_args.size() - positional_start < 3) {
+        std::size_t trailing_options_start = input_args.size();
+        if (have_positionals) {
+            if (input_args.size() - positional_start < 3) {
+                print_usage(argv[0]);
+                return 2;
+            }
+            config.listen_port = to_u16(input_args[positional_start].c_str());
+            config.upstream_host = input_args[positional_start + 1];
+            config.upstream_port = to_u16(input_args[positional_start + 2].c_str());
+            trailing_options_start = positional_start + 3;
+        } else if (!runtime_profile_loaded && config.serial_device.empty()) {
             print_usage(argv[0]);
             return 2;
         }
 
-        config.listen_port = to_u16(input_args[positional_start].c_str());
-        config.upstream_host = input_args[positional_start + 1];
-        config.upstream_port = to_u16(input_args[positional_start + 2].c_str());
-
-        for (std::size_t i = positional_start + 3; i < input_args.size(); ++i) {
+        for (std::size_t i = trailing_options_start; i < input_args.size(); ++i) {
             const std::string arg = input_args[i];
             if (arg == "--start-hex" && i + 1 < input_args.size()) {
                 config.start_marker_hex = input_args[++i];
@@ -592,6 +775,35 @@ int main(int argc, char** argv) {
                 config.max_plugin_buffer_bytes = static_cast<std::size_t>(std::stoul(input_args[++i]));
             } else if (arg == "--protocol-hint" && i + 1 < input_args.size()) {
                 config.protocol_hint = input_args[++i];
+            } else if (arg == "--observe-only") {
+                config.observe_only = true;
+            } else if (arg == "--trace-text" && i + 1 < input_args.size()) {
+                config.trace_text = input_args[++i];
+            } else if (arg == "--trace-hex" && i + 1 < input_args.size()) {
+                config.trace_hex = input_args[++i];
+            } else if (arg == "--cut-on-trace") {
+                config.cut_on_trace = true;
+            } else if (arg == "--trace-direction" && i + 1 < input_args.size()) {
+                const std::string value = input_args[++i];
+                config.trace_client_to_server = value == "c2s" || value == "both";
+                config.trace_server_to_client = value == "s2c" || value == "both";
+                if (!config.trace_client_to_server && !config.trace_server_to_client) {
+                    throw std::runtime_error("unknown trace direction: " + value);
+                }
+            } else if (arg == "--capture" && i + 1 < input_args.size()) {
+                config.capture_path = input_args[++i];
+            } else if (arg == "--capture-pcap" && i + 1 < input_args.size()) {
+                config.capture_pcap_path = input_args[++i];
+            } else if (arg == "--capture-hex") {
+                config.capture_hex = true;
+            } else if (arg == "--capture-max-bytes" && i + 1 < input_args.size()) {
+                config.capture_max_bytes = static_cast<std::size_t>(std::stoull(input_args[++i]));
+            } else if (arg == "--capture-snaplen" && i + 1 < input_args.size()) {
+                config.capture_snaplen = static_cast<std::size_t>(std::stoull(input_args[++i]));
+            } else if (arg == "--expect-connack") {
+                config.expect_mqtt_connack = true;
+            } else if (arg == "--save-runtime-profile" && i + 1 < input_args.size()) {
+                save_runtime_profile_path = input_args[++i];
             } else if (arg == "--audit-log" && i + 1 < input_args.size()) {
                 config.audit_log_path = input_args[++i];
             } else if (arg == "--audit-json" && i + 1 < input_args.size()) {
@@ -606,10 +818,51 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("unknown option: " + arg);
             }
         }
+
+        if (config.data_bits != 7 && config.data_bits != 8) {
+            throw std::runtime_error("data bits must be 7 or 8");
+        }
+        if (config.stop_bits != 1 && config.stop_bits != 2) {
+            throw std::runtime_error("stop bits must be 1 or 2");
+        }
+        if (config.parity != "none" && config.parity != "even" && config.parity != "odd") {
+            throw std::runtime_error("parity must be none, even, or odd");
+        }
+        if (config.flow_control != "none" && config.flow_control != "hardware" &&
+            config.flow_control != "xonxoff") {
+            throw std::runtime_error("flow control must be none, hardware, or xonxoff");
+        }
+        if (config.capture_max_bytes == 0 || config.capture_snaplen == 0) {
+            throw std::runtime_error("capture ceilings must be greater than zero");
+        }
+        if (!save_runtime_profile_path.empty()) {
+            const auto label = target_label.empty()
+                ? std::filesystem::path(save_runtime_profile_path).stem().string()
+                : target_label;
+            save_target_profile(
+                save_runtime_profile_path, runtime_target_profile(config, label));
+            std::cerr << "Saved runtime target profile " << save_runtime_profile_path << '\n';
+            if (!have_positionals && !runtime_profile_loaded) return 0;
+        }
     } catch (const std::exception& error) {
         std::cerr << "Argument error: " << error.what() << "\n";
         print_usage(argv[0]);
         return 2;
+    }
+
+    if (!config.serial_device.empty()) {
+        std::cout << "Ghostline field serial mode // upstream=" << config.serial_device
+                  << " baud=" << config.baud;
+        if (!config.serial_ingress_device.empty()) {
+            std::cout << " ingress=" << config.serial_ingress_device
+                      << " ingress-baud=" << config.ingress_baud;
+        } else {
+            std::cout << " tcp-ingress=" << config.listen_host << ':' << config.listen_port;
+        }
+        std::cout << " // observe-only\n";
+        if (!config.capture_path.empty()) std::cout << "Capture: " << config.capture_path << '\n';
+        if (!config.capture_pcap_path.empty()) std::cout << "Capture PCAP: " << config.capture_pcap_path << '\n';
+        return run_serial_bridge(config);
     }
 
     std::cout << "Ghostline listening on " << config.listen_host << ":" << config.listen_port
@@ -636,6 +889,14 @@ int main(int argc, char** argv) {
         std::cout << "Action JSON: " << config.action_json_path << "\n";
     }
     std::cout << "Review queue: " << config.review_queue_dir << "\n";
+    std::cout << "Mode: " << (config.observe_only ? "OBSERVE-ONLY" : "PLUGIN DECISION PIPELINE") << '\n';
+    if (!config.capture_path.empty()) std::cout << "Capture: " << config.capture_path << '\n';
+    if (!config.capture_pcap_path.empty()) {
+        std::cout << "Capture PCAP: " << config.capture_pcap_path << " (DLT_USER0)\n";
+    }
+    if (config.expect_mqtt_connack) {
+        std::cout << "MQTT: CONNACK summary armed\n";
+    }
 
     return run_transport_core(config);
 }

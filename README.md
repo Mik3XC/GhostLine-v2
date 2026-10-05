@@ -1,365 +1,195 @@
 # Ghostline Gate
 
-Ghostline Gate is a transport-first interception and mutation workbench for live TCP traffic. It is built around one rule above all others:
+Ghostline Gate is an inline transport workbench for traffic deliberately routed
+through it. It observes a TCP stream, frames supported messages, and can release
+one validated mutation or the original bytes. An exact byte trace can also
+produce an audit event or close that relay flow when containment is explicitly
+enabled.
 
-**original delivery always wins unless Ghostline can prove a modified release is safe.**
+The original RuneScape Tool is the myth and legend. Ghostline Gate
+keeps that story alive as a new transport proof of concept. It is powerful,
+and it still needs more testing.
 
-Today, Ghostline is a macOS-first Phase 1 system with a production-shaped CLI core, a usable Qt operator app, compiled-in protocol plugins, file-driven controls, JSONL audit/action streams, saved target profiles, and a pending review queue for risky mutations.
+**Original delivery has priority when Ghostline cannot validate a modified
+release.** A configured containment rule is a separate decision: it closes the
+matched flow.
 
-![Ghostline Overview](/Users/premise/Documents/github/ghostline-gate/Ghostline.png)
+![Ghostline overview](Ghostline.png)
 
-## What Ghostline Is
+## What is here
 
-Ghostline is not a packet sniffer and not just a proxy. It sits in the middle as a relay-oriented control point that can:
+| Binary | Purpose |
+| --- | --- |
+| `gl` | Short name for the Ghostline relay CLI |
+| `ghostline_cli` | Relay, capture, mutation, trace observation, and explicit flow cutoff |
+| `ghostline_shell` | Persistent full-screen terminal view of audit and action logs |
+| `ghostline_qt` | Qt operator window for targets, files, and review items |
+| `ghostline_qt --mode=ShadowBoxing` | Small blind-input Ghostline HUD |
 
-- observe live TCP flows
-- identify framed or frame-like windows
-- stage `original` and `modified` candidates
-- validate a modified candidate before release
-- fall back to untouched original bytes when mutation risk is too high
-- create operator review actions instead of silently forcing unsafe edits
+The Python host and server files under `tests/` generate controlled traffic.
+They are fixtures, not required client or server components of the product.
+Ghostline sees bytes only when a client connects through its listener, or when
+the serial bridge is placed between endpoints. It does not passively capture
+other processes' traffic.
 
-The current product direction is:
+## First build
 
-1. observe and locate
-2. frame and transform
-3. route and end-transform
-4. reframe when structure changes
-5. support audit and research workflows
-
-## Core Promise
-
-Ghostline is built around **Safe Original Priority**:
-
-- transport continuity must survive plugin uncertainty
-- no partial modified candidate may leak
-- failed mutation drops the modified path, not the flow
-- risky cases become review items
-- PID identity is metadata and targeting context, not the transport primitive
-
-That makes Ghostline suitable for operator-guided mutation workflows where a bad replacement could expose the intervention.
-
-## Current Architecture
-
-```mermaid
-flowchart LR
-    A["Target Discovery\nPID / Port / State Search"] --> B["Transport Core\npoll() relay + duplex flow state"]
-    B --> C["Plugin Layer\nraw-live / byte-window / mqtt / mq-family detectors"]
-    C --> D["Candidate Engine\noriginal candidate\nmodified candidate"]
-    D --> E["Validation Policy\nsafe to release?"]
-    E -->|Yes| F["Modified Release"]
-    E -->|No| G["Original Release"]
-    E -->|Risk / Review| H["Action Item + Review Queue"]
-    B --> I["Audit Streams\ntext + JSONL"]
-    H --> J["Qt Operator App\nprofiles / files / reviews / replay"]
-```
-
-## Phase 1 Feature Set
-
-### Transport Core
-
-- portable `poll()` relay core
-- directional independence and half-close awareness
-- plugin-aware buffering ceilings
-- safe fallback when framing or mutation cannot be completed
-
-### Plugin Layer
-
-Compiled into the binary today:
-
-- `raw-live`
-  raw chunk or end-marker driven live mutation
-- `byte-window`
-  generic start/end candidate matching
-- `mqtt`
-  authoritative framing with `PUBLISH` mutation and remaining-length reframe
-- `rabbitmq`
-  detection / audit target
-- `amqp`
-  detection / audit target
-- `activemq`
-  detection / audit target
-- `azure-service-bus`
-  detection / audit target
-- `kafka`
-  detection / audit target
-
-### Operator Workflow
-
-- saved target profiles
-- seeded protocol target profiles for MQTT, RMQ, AMQP, ActiveMQ, Azure Service Bus, and Kafka
-- pending review queue on disk
-- approve / reject / replay actions
-- file-driven controls via JSON, Jinja-style JSON, and lightweight HCL/Terraform-style configs
-- text and JSONL audit streams
-
-### Qt App
-
-The embedded Qt operator app is usable today for:
-
-- target discovery
-- saved profile management
-- review queue operations
-- replay artifact generation
-- loading rules, profiles, review items, and JSONL streams from disk
-
-## Repository Map
-
-```text
-include/                 Public headers for models, plugins, pid search, operator state
-src/                     Core engine, CLI, Qt app, audit, plugins, operator workflow
-tests/                   C++ tests, Python simulation harnesses, fixtures
-examples/                Rules, Python adapter example, Lua adapter example
-docs/                    Cheatsheet and supporting docs
-man/                     man page source
-tools/                   Rules resolver and utility scripts
-PHASE1_RUNBOOK.md        Canonical implementation workflow
-sim.bash                 Local end-to-end simulation harness
-```
-
-## Build
+Requires CMake, a C++17 compiler, and Python 3 for the rules resolver and test
+harness. Qt Widgets is optional.
 
 ```bash
 cmake -S . -B build-local
-cmake --build build-local
+cmake --build build-local -j
 ctest --test-dir build-local --output-on-failure
 ```
 
-Qt is enabled by default in CMake when Qt6 Widgets is available. To build the Qt target explicitly:
+The build creates `gl`, `ghostline_cli`, `ghostline_shell`, and
+`ghostline_tests`. It creates `ghostline_qt` when Qt Widgets is available.
+For Qt 5 or Qt 6 selection, dependencies, and troubleshooting, see
+[BUILD.md](BUILD.md). Linux validation and remaining work are recorded in
+[LINUX.md](LINUX.md).
+
+## Run
+
+Start the persistent terminal view from the repository root:
 
 ```bash
-cmake -S . -B build-local -DGHOSTLINE_BUILD_QT=ON
-cmake --build build-local --target ghostline_qt
+./build-local/ghostline_shell
 ```
 
-## Run the CLI
-
-Raw live mutation:
+In a second terminal, start an observe-only relay to a local service you
+control:
 
 ```bash
-./build-local/ghostline_cli 7777 127.0.0.1 8888 \
-  --raw-live \
-  --raw-find-text old \
-  --replace-text new \
-  --raw-chunk-bytes 1024 \
-  --protocol-hint raw-live
+./build-local/gl 17777 127.0.0.1 9000 \
+  --observe-only \
+  --audit-log ghostline_audit.log \
+  --actions-json ghostline_actions.jsonl
 ```
 
-MQTT mutation:
+Point the test client at `127.0.0.1:17777`. The upstream service must be
+listening on `127.0.0.1:9000`. The shell follows the audit and action logs
+as they change. Press `?` for controls, `p` to pause, `:` for commands,
+and `q` to exit. Run `./build-local/ghostline_shell --snapshot --no-state`
+for a single printable view. Shell settings persist in
+`~/.config/ghostline/shell.state` unless `--no-state` is used.
+
+## Observe a trace or cut a flow
+
+Trace matching spans TCP read boundaries. Observation is the default:
 
 ```bash
-./build-local/ghostline_cli 7777 127.0.0.1 1883 \
+./build-local/gl 17777 127.0.0.1 9000 \
+  --trace-text "classified-demo-trace" \
+  --trace-direction c2s
+```
+
+Enable inline cutoff explicitly:
+
+```bash
+./build-local/gl 17777 127.0.0.1 9000 \
+  --trace-hex 636c61737369666965642d64656d6f2d7472616365 \
+  --trace-direction c2s \
+  --cut-on-trace
+```
+
+The text and hex examples represent the same bytes. A match emits
+`trace-match`; a cutoff emits `containment-stream-cut`. Cutoff closes both
+directions of that relay flow. Bytes already forwarded before the match cannot
+be recalled. Payload signatures are not visible inside end-to-end encrypted
+traffic.
+
+## Frame and mutation support
+
+| Plugin | Current behavior |
+| --- | --- |
+| `raw-live` | Frames fixed chunks or end-marker windows; stages and validates a replacement |
+| `byte-window` | Matches configured start/end markers; falls back to original when a size change cannot be validated |
+| `mqtt` | Frames MQTT packets; can replace a PUBLISH payload and recalculate Remaining Length |
+| `rabbitmq` | Frames AMQP 0-9-1 headers and frames; observe only |
+| `amqp` | Frames AMQP 1.0 headers and frames; observe only |
+| `kafka` | Frames length-prefixed requests/responses; observe only |
+| `activemq`, `azure-service-bus` | Detection and audit targets; observe only |
+
+The candidate path keeps original and modified bytes separate, validates a
+replacement, and queues exactly one release. On framing failure or a plugin
+buffer ceiling, the affected flow switches to original-byte observation.
+Risky changes can create review items. An approved review or generated replay
+artifact does not reinject bytes into a live flow.
+
+MQTT example:
+
+```bash
+./build-local/gl 17777 127.0.0.1 1883 \
+  --protocol-hint mqtt \
   --replace-text patched-payload \
-  --protocol-hint mqtt
+  --mutate-direction c2s
 ```
 
-Rules-driven run:
+## Capture and operator modes
+
+Capture stores bounded application-stream reads before plugin decisions:
 
 ```bash
-./build-local/ghostline_cli 7777 127.0.0.1 8888 \
-  --rules examples/rules/raw-live.json
+./build-local/gl 17777 127.0.0.1 1883 \
+  --observe-only --protocol-hint mqtt --expect-connack \
+  --capture state/mqtt.glcap --capture-pcap state/mqtt.pcap
+./build-local/gl --read-capture state/mqtt.glcap --capture-tail 24
 ```
 
-Useful help surfaces:
+`GLCAP1` is text with hex/ASCII. The PCAP uses `DLT_USER0` application data;
+it contains no reconstructed Ethernet, IP, or TCP headers. The POSIX serial
+bridge supports TCP-to-serial and serial-pair observation. See
+[Field Capture](docs/GHOSTLINE-FIELD-CAPTURE.md).
 
-```bash
-./build-local/ghostline_cli -h
-./build-local/ghostline_cli --help-rules
-./build-local/ghostline_cli --help-search
-./build-local/ghostline_cli --help-profiles
-./build-local/ghostline_cli --help-review
-./build-local/ghostline_cli --help-examples
-./build-local/ghostline_cli --help-cheatsheet
-```
-
-Man page:
-
-```bash
-MANPATH="$PWD/man:${MANPATH}" man ghostline_cli
-```
-
-## Run the Qt App
+The full Qt operator window:
 
 ```bash
 ./build-local/ghostline_qt
 ```
 
-### Qt Operator Map
-
-```mermaid
-flowchart TB
-    A["Targets Tab"] --> A1["PID Search"]
-    A --> A2["Save / Load Target Profiles"]
-    A --> A3["Seed Protocol Profiles"]
-    A --> A4["Open Profile File"]
-
-    B["Reviews Tab"] --> B1["Pending Review Queue"]
-    B --> B2["Approve / Reject"]
-    B --> B3["Replay Artifact Creation"]
-    B --> B4["Open Review File"]
-
-    C["Files Tab"] --> C1["Load Rules Files"]
-    C --> C2["Load Audit JSONL"]
-    C --> C3["Load Action JSONL"]
-    C --> C4["Inspect Raw File Entries"]
-```
-
-## Rules and External Control
-
-Ghostline supports file-driven control so sessions are reproducible and scriptable.
-
-Supported rule inputs:
-
-- JSON
-- Jinja-style JSON templates rendered with `--rules-var key=value`
-- lightweight HCL/Terraform-style flat assignments
-
-Supported machine-readable outputs:
-
-- `--audit-json <path>`
-- `--actions-json <path>`
-
-Example Jinja-driven MQTT run:
+The ShadowBoxing HUD:
 
 ```bash
-./build-local/ghostline_cli 7777 127.0.0.1 1883 \
-  --rules examples/rules/mqtt_publish.jinja \
-  --rules-var replacement_text=patched-payload \
-  --rules-var mqtt_review_threshold=8 \
-  --rules-var audit_json_path=sim-output/mqtt/audit.jsonl \
-  --rules-var action_json_path=sim-output/mqtt/actions.jsonl
+./build-local/ghostline_qt --mode=ShadowBoxing
 ```
 
-Example lightweight HCL/Terraform-style control:
+It opens at the bottom-right, approximately 1.5 by 1 logical inches, with a
+grey backing and 80% window opacity. Click it, type without an input echo, and
+press Enter to see a compact result. `gl --search-port 1883 --listen-only`
+invokes the adjacent Ghostline CLI. `gl | pwd & ls` runs `pwd`, then `ls`,
+as direct terminal programs. `&` is sequential in this HUD; shell expansion
+and redirection are not implemented. Blind built-ins are `help`, `clear`,
+`stop`, and `quit`. Use `--corner=bottom-left` for the other corner.
 
-```hcl
-protocol_hint = "raw-live"
-raw_live = true
-raw_find_text = "hello"
-replace_text = "patch"
-mutate_direction = "c2s"
-raw_chunk_bytes = 1024
-raw_review_threshold_bytes = 8
-audit_json_path = "ghostline_audit.jsonl"
-action_json_path = "ghostline_actions.jsonl"
-```
-
-## Target Discovery and Profiles
-
-Find candidate targets:
-
-```bash
-./build-local/ghostline_cli --search-pid mqtt
-./build-local/ghostline_cli --search-port 1883 --listen-only
-./build-local/ghostline_cli --search-json --search-pid ollama
-```
-
-Save or inspect profiles:
-
-```bash
-./build-local/ghostline_cli --save-target-profile /tmp/targets/ollama.json --target-label ollama-local
-./build-local/ghostline_cli --show-target-profile /tmp/targets/ollama.json
-./build-local/ghostline_cli --list-target-profiles ghostline_target_profiles
-```
-
-Seed protocol presets:
-
-```bash
-./build-local/ghostline_cli --seed-target-profiles ghostline_target_profiles
-```
-
-Preset targets written today:
-
-- MQTT on `1883`
-- RabbitMQ / RMQ on `5672`
-- AMQP on `5672`
-- ActiveMQ on `61616`
-- Azure Service Bus on `5671`
-- Kafka on `9092`
-
-## Review Queue and Replay
-
-Ghostline records risky mutations as action items instead of forcing them through.
-
-Review queue commands:
-
-```bash
-./build-local/ghostline_cli --review-list
-./build-local/ghostline_cli --review-approve action-1-3 --review-note approved
-./build-local/ghostline_cli --review-reject action-1-3 --review-note rejected
-./build-local/ghostline_cli --review-replay action-1-3 --review-note replay-now
-```
-
-Replay creates an operator artifact for later action. It does not inject traffic into a live flow yet.
-
-## Simulation and Test Mode
-
-Run the local simulation harness:
+## Test fixtures and evidence
 
 ```bash
 MODE=raw ./sim.bash
 MODE=mqtt ./sim.bash
 ```
 
-The sim harness:
+The CTest suite includes C++ plugin and capture checks, Python rules loading,
+and a localhost trace test that splits a signature across two writes and
+checks both observation and cutoff. The raw and MQTT simulations exercise
+fixture traffic end to end. The byte-window simulation currently reuses an
+expectation that conflicts with its safe original fallback, so it is not part
+of the passing quick path.
 
-- builds Ghostline
-- starts a host and server
-- runs `ghostline_cli`
-- asserts expected mutation behavior
-- checks audit and action streams
+Ghostline uses text and optional JSONL audit/action outputs. Review items and
+replay artifacts are saved on disk. Logs and captures may include complete
+payload bytes, so inspect them before sharing a run.
 
-Artifacts are typically written under [sim-output](/Users/premise/Documents/github/ghostline-gate/sim-output).
+## Scope and next work
 
-## Version Timeline
+The active runtime uses a portable `poll()` TCP relay and a POSIX serial
+bridge. The older `src/linux_epoll_proxy.cpp` is a separate prototype and is
+not built by the current CMake target. Linux needs a clean native build and
+runtime pass before it is called validated. Windows serial execution is not
+implemented. Queue backpressure, bounded audit retention, richer protocol
+ownership, and live Qt flow controls remain future work.
 
-```mermaid
-timeline
-    title Ghostline Roadmap
-    v1 : Transport-first CLI core
-       : Raw-live and byte-window mutation
-       : MQTT framing and PUBLISH mutation
-       : JSONL audit/actions
-       : PID search, target profiles, review queue
-       : Qt operator app for files, targets, and reviews
-    v2 : Deeper protocol plugins
-       : RMQ / AMQP / ActiveMQ / ASB / Kafka framing ownership
-       : Stronger review policies and replay workflows
-       : Richer live stream inspection
-       : More complete operator timeline views
-    v3 : Full operator platform
-       : Protocol-owned reframe/mutation across families
-       : Rich routing and reinjection workflows
-       : Saved session orchestration
-       : Mature embedded GUI with flow timelines and live controls
-```
-
-## Plugin Evolution Map
-
-| Version | Plugin State | GUI State | Operator State |
-| --- | --- | --- | --- |
-| `v1` | Raw-live, byte-window, MQTT active; MQ-family detection profiles compiled in | Targets, Reviews, Files tabs | Profiles, queue, replay artifacts |
-| `v2` | Multi-protocol framing ownership | Live flow summaries and richer review views | Review thresholds and replay workflows deepen |
-| `v3` | Full protocol family mutation/reframe platform | Embedded operator console with live timelines | Session orchestration and routing workflows |
-
-## Current Limitations
-
-- MQTT is the only protocol-owned framing/mutation plugin today.
-- RMQ, AMQP, ActiveMQ, Azure Service Bus, and Kafka are still seeded and compiled as detection / audit targets, not full mutation owners.
-- The Qt app loads files and manages operator workflow, but it does not yet render a full live session timeline.
-- HCL/Terraform support is intentionally lightweight and flat, not a full Terraform evaluator.
-
-## Where To Extend Next
-
-- deepen protocol framing for the MQ-family plugins
-- add richer live flow timelines to Qt
-- connect replay artifacts to future guided reinjection
-- keep [PHASE1_RUNBOOK.md](/Users/premise/Documents/github/ghostline-gate/PHASE1_RUNBOOK.md) as the canonical implementation workflow
-
-## Quick Links
-
-- Runbook: [PHASE1_RUNBOOK.md](/Users/premise/Documents/github/ghostline-gate/PHASE1_RUNBOOK.md)
-- Cheatsheet: [docs/ghostline_cli_cheatsheet.md](/Users/premise/Documents/github/ghostline-gate/docs/ghostline_cli_cheatsheet.md)
-- Man page: [man/man1/ghostline_cli.1](/Users/premise/Documents/github/ghostline-gate/man/man1/ghostline_cli.1)
-- Qt app: [src/qt_operator_main.cpp](/Users/premise/Documents/github/ghostline-gate/src/qt_operator_main.cpp)
-- Core transport: [src/transport_core.cpp](/Users/premise/Documents/github/ghostline-gate/src/transport_core.cpp)
+Documentation: [BUILD.md](BUILD.md) · [LINUX.md](LINUX.md) ·
+[Phase 1 runbook](PHASE1_RUNBOOK.md) ·
+[CLI cheatsheet](docs/ghostline_cli_cheatsheet.md) ·
+[Field Capture](docs/GHOSTLINE-FIELD-CAPTURE.md)

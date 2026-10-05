@@ -1,5 +1,35 @@
 # Ghostline CLI Cheatsheet
 
+## Field capture / micro Wireshark
+
+```bash
+ghostline_cli 17777 127.0.0.1 1883 \
+  --observe-only --protocol-hint mqtt --expect-connack \
+  --capture state/mqtt.glcap --capture-pcap state/mqtt.pcap \
+  --capture-max-bytes 4194304 --capture-snaplen 1024
+
+ghostline_cli --read-capture state/mqtt.glcap --capture-tail 24
+```
+
+GLCAP1 is terminal/recovery text. PCAP is `DLT_USER0` application-stream data;
+it does not contain fabricated Ethernet/IP/TCP headers.
+
+## Serial / vCOM
+
+```bash
+# TCP client to one serial device
+ghostline_cli --serial-device /dev/ttyWK0 --baud 115200 \
+  --listen-port 17777 --capture state/uart.glcap
+
+# serial/vCOM pair with independent baud
+ghostline_cli --serial-ingress /dev/ttyVIRTUAL0 --ingress-baud 57600 \
+  --serial-device /dev/ttyUSB0 --baud 115200 \
+  --capture state/serial-pair.glcap
+```
+
+Serial relays are forced observe-only. Seed profiles include com0com `COM5` and
+`COM6` placeholders, but the active serial runtime is currently macOS/Linux.
+
 Ghostline is built around one operating rule:
 
 `original delivery wins unless modified release is proven safe`
@@ -32,13 +62,52 @@ cmake --build build-local
 ctest --test-dir build-local --output-on-failure
 ```
 
+Short CLI name:
+
+```bash
+./build-local/gl --search-port 1883 --listen-only
+export PATH="$PWD/build-local:$PATH"
+gl --search-pid mqtt
+```
+
 Run the Qt operator app:
 
 ```bash
 ./build-local/ghostline_qt
 ```
 
+ShadowBoxing blind-input HUD:
+
+```bash
+./build-local/ghostline_qt --mode=ShadowBoxing
+./build-local/ghostline_qt --mode=ShadowBoxing --corner=bottom-left
+```
+
+Click the HUD, type Ghostline CLI arguments without echo, then press Enter.
+The readout shows only output or an error. Built-ins are `help`, `clear`,
+`stop`, and `quit`.
+
+```text
+gl ARGS          Ghostline CLI
+gl | pwd & ls    terminal pwd, followed by terminal ls
+```
+
 ## Common Workflows
+
+### Watch or cut a classified byte trace
+
+```bash
+# Observation only
+./build-local/ghostline_cli 17777 192.0.2.10 9000 \
+  --trace-text "classified-demo-trace" --trace-direction c2s
+
+# Explicit inline containment
+./build-local/ghostline_cli 17777 192.0.2.10 9000 \
+  --trace-text "classified-demo-trace" --trace-direction c2s --cut-on-trace
+```
+
+The matcher spans TCP reads. A passive traffic copy can produce the trace event;
+closing a flow requires Ghostline to be the authorized inline relay.
 
 ### Find a target process
 

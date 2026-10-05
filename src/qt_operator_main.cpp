@@ -3,7 +3,10 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QCoreApplication>
+#include <QDir>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -12,8 +15,14 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPlainTextEdit>
+#include <QProcess>
 #include <QPushButton>
+#include <QScreen>
+#include <QShowEvent>
+#include <QStandardPaths>
+#include <QKeyEvent>
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTextStream>
@@ -21,6 +30,7 @@
 #include <QWidget>
 
 #include <filesystem>
+#include <deque>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -796,10 +806,390 @@ private:
     std::string current_file_type_;
 };
 
+QStringList split_blind_command(const QString& command, QString& error) {
+    QStringList output;
+    QString current;
+    QChar quote;
+    bool escaped = false;
+    for (const QChar ch : command) {
+        if (escaped) {
+            current.append(ch);
+            escaped = false;
+        } else if (ch == '\\') {
+            escaped = true;
+        } else if (!quote.isNull()) {
+            if (ch == quote) quote = QChar();
+            else current.append(ch);
+        } else if (ch == '"' || ch == '\'') {
+            quote = ch;
+        } else if (ch.isSpace()) {
+            if (!current.isEmpty()) {
+                output.append(current);
+                current.clear();
+            }
+        } else {
+            current.append(ch);
+        }
+    }
+    if (escaped) current.append('\\');
+    if (!quote.isNull()) {
+        error = "ERR // UNTERMINATED QUOTE";
+        return {};
+    }
+    if (!current.isEmpty()) output.append(current);
+    return output;
+}
+
+QStringList split_blind_chain(const QString& command, QString& error) {
+    QStringList output;
+    QString current;
+    QChar quote;
+    bool escaped = false;
+    for (const QChar ch : command) {
+        if (escaped) {
+            current.append(ch);
+            escaped = false;
+        } else if (ch == '\\') {
+            current.append(ch);
+            escaped = true;
+        } else if (!quote.isNull()) {
+            current.append(ch);
+            if (ch == quote) quote = QChar();
+        } else if (ch == '"' || ch == '\'') {
+            quote = ch;
+            current.append(ch);
+        } else if (ch == '&') {
+            if (!current.trimmed().isEmpty()) output.append(current.trimmed());
+            current.clear();
+        } else {
+            current.append(ch);
+        }
+    }
+    if (!quote.isNull()) {
+        error = "ERR // UNTERMINATED QUOTE";
+        return {};
+    }
+    if (!current.trimmed().isEmpty()) output.append(current.trimmed());
+    return output;
+}
+
+QString compact_hud_output(const QString& input) {
+    const QString normalized = input.trimmed();
+    if (normalized.isEmpty()) return {};
+    const QStringList all_lines = normalized.split('\n', Qt::SkipEmptyParts);
+    QStringList lines;
+    for (const QString& line : all_lines) {
+        const QString clean = line.trimmed();
+        if (!clean.isEmpty()) lines.append(clean);
+    }
+    constexpr int visible_lines = 3;
+    if (lines.size() > visible_lines) {
+        const int hidden = lines.size() - visible_lines;
+        lines = lines.mid(0, visible_lines);
+        lines.append(QString("+%1 lines").arg(hidden));
+    }
+    QString result = lines.join("\n");
+    constexpr int limit = 360;
+    if (result.size() > limit) result = result.left(limit - 1) + "~";
+    return result;
+}
+
+class ShadowBoxingHud : public QWidget {
+public:
+    explicit ShadowBoxingHud(const bool bottom_left) : bottom_left_(bottom_left) {
+        setWindowTitle("Ghostline ShadowBoxing");
+        setObjectName("shadowBoxingHud");
+        setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
+        setAttribute(Qt::WA_StyledBackground, true);
+        setWindowOpacity(0.80);
+        setFocusPolicy(Qt::StrongFocus);
+        setCursor(Qt::PointingHandCursor);
+
+        auto* layout = new QVBoxLayout(this);
+        layout->setContentsMargins(8, 6, 8, 6);
+        readout_ = new QLabel("NULL");
+        readout_->setWordWrap(true);
+        readout_->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        readout_->setTextInteractionFlags(Qt::NoTextInteraction);
+        readout_->setStyleSheet(
+            "QLabel { color: #d8dadd; background: transparent; "
+            "font-family: Menlo, Monaco, monospace; font-size: 10px; }");
+        layout->addWidget(readout_);
+        setStyleSheet("QWidget#shadowBoxingHud { background-color: #34363a; border: 1px solid #8a8e94; }");
+
+        process_ = new QProcess(this);
+        process_->setProcessChannelMode(QProcess::SeparateChannels);
+        connect(process_, &QProcess::readyReadStandardOutput, this, [this]() { show_process_output(false); });
+        connect(process_, &QProcess::readyReadStandardError, this, [this]() { show_process_output(true); });
+        connect(process_, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+                this, [this](const int code, QProcess::ExitStatus status) {
+            standard_error_.append(process_->readAllStandardError());
+            standard_output_.append(process_->readAllStandardOutput());
+            const bool failed = status != QProcess::NormalExit || code != 0;
+            if (terminal_mode_) {
+                const QString raw = QString::fromLocal8Bit(
+                    failed && !standard_error_.isEmpty() ? standard_error_ : standard_output_);
+                const QString detail = compact_hud_output(raw);
+                terminal_results_.append("terminal: " + active_label_
+                    + (detail.isEmpty() ? (failed ? " // ERR" : " // OK") : "\n" + detail));
+                if (failed) terminal_queue_.clear();
+                if (!terminal_queue_.empty()) {
+                    start_next_terminal_command();
+                } else {
+                    terminal_mode_ = false;
+                    set_readout(terminal_results_.join("\n"));
+                }
+                return;
+            }
+            if (failed) {
+                const QString detail = QString::fromLocal8Bit(
+                    standard_error_.isEmpty() ? standard_output_ : standard_error_).trimmed();
+                const QString compact = compact_hud_output(detail);
+                set_readout(compact.isEmpty() ? QString("ERR // EXIT %1").arg(code) : "ERR // " + compact);
+            } else {
+                const QString detail = QString::fromLocal8Bit(
+                    standard_output_.isEmpty() ? standard_error_ : standard_output_).trimmed();
+                const QString compact = compact_hud_output(detail);
+                set_readout(compact.isEmpty() ? "OK" : compact);
+            }
+        });
+        connect(process_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+            set_readout("ERR // " + process_->errorString());
+        });
+
+        resize_to_inches();
+    }
+
+protected:
+    void showEvent(QShowEvent* event) override {
+        QWidget::showEvent(event);
+        resize_to_inches();
+        move_to_corner();
+    }
+
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton) {
+            blind_input_.clear();
+            armed_ = true;
+            setFocus(Qt::MouseFocusReason);
+            set_readout("NULL // INPUT ARMED");
+        }
+        QWidget::mousePressEvent(event);
+    }
+
+    void keyPressEvent(QKeyEvent* event) override {
+        if (!armed_) {
+            if (event->key() == Qt::Key_Escape) close();
+            return;
+        }
+        if (event->key() == Qt::Key_Escape) {
+            blind_input_.clear();
+            armed_ = false;
+            set_readout("NULL");
+            return;
+        }
+        if (event->key() == Qt::Key_Backspace) {
+            if (!blind_input_.isEmpty()) blind_input_.chop(1);
+            return;
+        }
+        if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+            const QString command = blind_input_;
+            blind_input_.clear();
+            armed_ = false;
+            execute(command);
+            return;
+        }
+        const QString text = event->text();
+        if (!text.isEmpty() && text.at(0).isPrint()) blind_input_.append(text);
+    }
+
+private:
+    void resize_to_inches() {
+        QScreen* screen = QGuiApplication::screenAt(frameGeometry().center());
+        if (screen == nullptr) screen = QGuiApplication::primaryScreen();
+        const qreal dpi = screen == nullptr ? 96.0 : screen->logicalDotsPerInch();
+        setFixedSize(std::max(120, qRound(1.5 * dpi)), std::max(80, qRound(1.0 * dpi)));
+    }
+
+    void move_to_corner() {
+        QScreen* screen = QGuiApplication::screenAt(frameGeometry().center());
+        if (screen == nullptr) screen = QGuiApplication::primaryScreen();
+        if (screen == nullptr) return;
+        const QRect available = screen->availableGeometry();
+        const int margin = 12;
+        const int x = bottom_left_ ? available.left() + margin : available.right() - width() - margin + 1;
+        const int y = available.bottom() - height() - margin + 1;
+        move(x, y);
+    }
+
+    void set_readout(QString text) {
+        text.replace('\r', ' ');
+        const int limit = 700;
+        if (text.size() > limit) text = "~" + text.right(limit - 1);
+        readout_->setText(text);
+    }
+
+    void show_process_output(const bool error_channel) {
+        const QByteArray bytes = error_channel
+            ? process_->readAllStandardError() : process_->readAllStandardOutput();
+        if (error_channel) standard_error_.append(bytes);
+        else standard_output_.append(bytes);
+        const QString output = QString::fromLocal8Bit(
+            error_channel ? standard_error_ : standard_output_).trimmed();
+        if (!output.isEmpty()) {
+            const QString compact = compact_hud_output(output);
+            set_readout((error_channel ? "ERR // " : "") + compact);
+        }
+    }
+
+    void execute(const QString& raw_command) {
+        const QString command = raw_command.trimmed();
+        if (command.isEmpty()) {
+            set_readout("ERR // EMPTY COMMAND");
+            return;
+        }
+        if (command == "clear" || command == "null") {
+            set_readout("NULL");
+            return;
+        }
+        if (command == "quit" || command == "exit") {
+            close();
+            return;
+        }
+        if (command == "stop") {
+            if (process_->state() == QProcess::NotRunning) set_readout("ERR // NO ACTIVE COMMAND");
+            else { process_->terminate(); set_readout("STOP REQUESTED"); }
+            return;
+        }
+        if (command == "help") {
+            set_readout("gl ARGS = Ghostline\ngl | CMD & CMD = terminal sequence\nclear | stop | quit");
+            return;
+        }
+        if (process_->state() != QProcess::NotRunning) {
+            set_readout("ERR // COMMAND ALREADY RUNNING");
+            return;
+        }
+
+        const bool terminal_escape = command.startsWith("gl |") || command.startsWith("ghostline_cli |");
+        if (terminal_escape) {
+            const int separator = command.indexOf('|');
+            QString error;
+            const QStringList chain = split_blind_chain(command.mid(separator + 1).trimmed(), error);
+            if (!error.isEmpty()) { set_readout(error); return; }
+            if (chain.isEmpty()) { set_readout("ERR // EMPTY TERMINAL CHAIN"); return; }
+            terminal_queue_.clear();
+            terminal_results_.clear();
+            for (const QString& item : chain) {
+                QString parse_error;
+                QStringList words = split_blind_command(item, parse_error);
+                if (!parse_error.isEmpty() || words.isEmpty()) {
+                    set_readout(parse_error.isEmpty() ? "ERR // EMPTY TERMINAL COMMAND" : parse_error);
+                    terminal_queue_.clear();
+                    return;
+                }
+                TerminalCommand pending;
+                pending.label = item;
+                pending.program = words.takeFirst();
+                pending.arguments = words;
+                terminal_queue_.push_back(std::move(pending));
+            }
+            terminal_mode_ = true;
+            start_next_terminal_command();
+            return;
+        }
+
+        QString error;
+        QStringList arguments = split_blind_command(command, error);
+        if (!error.isEmpty()) { set_readout(error); return; }
+        if (!arguments.isEmpty()) {
+            const QString first = QFileInfo(arguments.first()).fileName();
+            if (first == "gl" || first == "gl.exe" ||
+                first == "ghostline_cli" || first == "ghostline_cli.exe") arguments.removeFirst();
+        }
+        if (arguments.isEmpty()) {
+            set_readout("ERR // EMPTY GHOSTLINE COMMAND");
+            return;
+        }
+
+        const QString executable = QCoreApplication::applicationDirPath()
+            + QDir::separator() + "ghostline_cli";
+        if (!QFileInfo::exists(executable)) {
+            set_readout("ERR // ghostline_cli NOT FOUND NEXT TO HUD");
+            return;
+        }
+        set_readout("RUNNING");
+        standard_output_.clear();
+        standard_error_.clear();
+        process_->setProgram(executable);
+        process_->setArguments(arguments);
+        process_->start();
+    }
+
+    struct TerminalCommand {
+        QString program;
+        QStringList arguments;
+        QString label;
+    };
+
+    void start_next_terminal_command() {
+        if (terminal_queue_.empty()) return;
+        const TerminalCommand command = terminal_queue_.front();
+        terminal_queue_.pop_front();
+        QString executable = QStandardPaths::findExecutable(command.program);
+        if (executable.isEmpty()) {
+            terminal_results_.append("terminal: " + command.label + "\nERR // COMMAND NOT FOUND");
+            terminal_queue_.clear();
+            terminal_mode_ = false;
+            set_readout(terminal_results_.join("\n"));
+            return;
+        }
+        active_label_ = command.label;
+        standard_output_.clear();
+        standard_error_.clear();
+        set_readout("terminal: " + active_label_ + " // RUNNING");
+        process_->setProgram(executable);
+        process_->setArguments(command.arguments);
+        process_->start();
+    }
+
+    QLabel* readout_ = nullptr;
+    QProcess* process_ = nullptr;
+    QByteArray standard_output_;
+    QByteArray standard_error_;
+    std::deque<TerminalCommand> terminal_queue_;
+    QStringList terminal_results_;
+    QString active_label_;
+    bool terminal_mode_ = false;
+    QString blind_input_;
+    bool armed_ = false;
+    bool bottom_left_ = false;
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
+    bool shadow_boxing = false;
+    bool bottom_left = false;
+    const QStringList arguments = QCoreApplication::arguments();
+    for (int index = 1; index < arguments.size(); ++index) {
+        const QString arg = arguments[index];
+        if (arg.compare("--mode=ShadowBoxing", Qt::CaseInsensitive) == 0 ||
+            (arg == "--mode" && index + 1 < arguments.size() &&
+             arguments[index + 1].compare("ShadowBoxing", Qt::CaseInsensitive) == 0)) {
+            shadow_boxing = true;
+        } else if (arg == "--corner=bottom-left") {
+            bottom_left = true;
+        }
+    }
+    if (shadow_boxing) {
+        ShadowBoxingHud hud(bottom_left);
+        hud.show();
+        hud.raise();
+        hud.activateWindow();
+        QApplication::setActiveWindow(&hud);
+        return app.exec();
+    }
     GhostlineOperatorWindow window;
     window.show();
     return app.exec();

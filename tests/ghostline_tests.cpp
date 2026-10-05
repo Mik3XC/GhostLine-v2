@@ -1,10 +1,12 @@
 #include "ghostline/plugin.hpp"
 #include "ghostline/pid_search.hpp"
 #include "ghostline/operator_state.hpp"
+#include "ghostline/capture.hpp"
 
 #include <filesystem>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 
 namespace {
@@ -57,6 +59,56 @@ void test_observation_plugin_stays_passive() {
     Candidate candidate = plugin->build_candidate(flow, Direction::ClientToServer, input);
     CandidateDecision decision = plugin->decide(flow, Direction::ClientToServer, candidate);
     expect(decision.release == CandidateRelease::ReleaseOriginal, "observe-only plugin should release original");
+}
+
+void test_amqp_observation_plugin_frames_protocol_and_method_frames() {
+    MutationConfig config;
+    PluginRegistry registry(config);
+    FlowContext flow;
+    flow.preferred_plugin = "rabbitmq";
+    const ProtocolPlugin* plugin = registry.match(flow, Direction::ClientToServer, 5672, ByteVec{'A', 'M', 'Q', 'P'});
+    expect(plugin != nullptr && plugin->uses_protocol_framing(), "expected framed rabbitmq plugin");
+
+    const ByteVec protocol_header{'A', 'M', 'Q', 'P', 0, 0, 9, 1};
+    FramingResult framed = plugin->frame(flow, Direction::ClientToServer, protocol_header);
+    expect(framed.disposition == FramingDisposition::FramedPacket, "expected AMQP protocol header frame");
+    expect(framed.consumed_bytes == 8, "expected eight-byte AMQP protocol header");
+
+    const ByteVec method_frame{1, 0, 1, 0, 0, 0, 2, 0, 10, 0xce};
+    framed = plugin->frame(flow, Direction::ClientToServer, method_frame);
+    expect(framed.disposition == FramingDisposition::FramedPacket, "expected complete AMQP method frame");
+    expect(framed.packet_type == "AMQP-METHOD", "expected AMQP method label");
+    Candidate candidate = plugin->build_candidate(flow, Direction::ClientToServer, framed.frame_bytes, &framed);
+    CandidateDecision decision = plugin->decide(flow, Direction::ClientToServer, candidate);
+    expect(decision.release == CandidateRelease::ReleaseOriginal, "AMQP observation must retain original frame");
+}
+
+void test_kafka_observation_plugin_frames_length_prefix() {
+    MutationConfig config;
+    PluginRegistry registry(config);
+    FlowContext flow;
+    flow.preferred_plugin = "kafka";
+    const ByteVec request{0, 0, 0, 8, 0, 3, 0, 9, 0, 0, 0, 42};
+    const ProtocolPlugin* plugin = registry.match(flow, Direction::ClientToServer, 9092, request);
+    expect(plugin != nullptr && plugin->uses_protocol_framing(), "expected framed kafka plugin");
+    const FramingResult framed = plugin->frame(flow, Direction::ClientToServer, request);
+    expect(framed.disposition == FramingDisposition::FramedPacket, "expected complete Kafka request frame");
+    expect(framed.packet_type == "KAFKA-REQUEST", "expected Kafka request label");
+    expect(framed.detail.find("correlation-id=42") != std::string::npos, "expected Kafka correlation id");
+}
+
+void test_amqp10_observation_plugin_frames_performative() {
+    MutationConfig config;
+    PluginRegistry registry(config);
+    FlowContext flow;
+    flow.preferred_plugin = "amqp";
+    const ByteVec frame{0, 0, 0, 8, 2, 0, 0, 7};
+    const ProtocolPlugin* plugin = registry.match(flow, Direction::ClientToServer, 5672, frame);
+    expect(plugin != nullptr && plugin->uses_protocol_framing(), "expected framed AMQP 1.0 plugin");
+    const FramingResult framed = plugin->frame(flow, Direction::ClientToServer, frame);
+    expect(framed.disposition == FramingDisposition::FramedPacket, "expected complete AMQP 1.0 frame");
+    expect(framed.packet_type == "AMQP10-FRAME", "expected AMQP 1.0 frame label");
+    expect(framed.detail.find("channel=7") != std::string::npos, "expected AMQP 1.0 channel");
 }
 
 void test_size_mutation_requires_safe_rewrite() {
@@ -425,6 +477,14 @@ void test_target_profile_save_and_load() {
     profile.query.process_contains = "ollama";
     profile.query.port = 11434;
     profile.query.listen_only = true;
+    profile.transport = "serial-pair";
+    profile.serial_ingress_device = "COM5";
+    profile.serial_device = "COM6";
+    profile.ingress_baud = 57600;
+    profile.baud = 115200;
+    profile.protocol_hint = "mqtt";
+    profile.expect_connack = true;
+    profile.capture_path = "field.glcap";
 
     ProcessSocketEntry match;
     match.pid = 3860;
@@ -437,11 +497,18 @@ void test_target_profile_save_and_load() {
     expect(loaded.query.process_contains == "ollama", "expected process query");
     expect(loaded.query.port == 11434, "expected port query");
     expect(loaded.query.listen_only, "expected listen flag");
+    expect(loaded.transport == "serial-pair", "expected profile transport");
+    expect(loaded.serial_ingress_device == "COM5" && loaded.serial_device == "COM6",
+           "expected com0com endpoints");
+    expect(loaded.ingress_baud == 57600 && loaded.baud == 115200,
+           "expected profile baud rates");
+    expect(loaded.expect_connack && loaded.protocol_hint == "mqtt",
+           "expected mqtt connack profile state");
 }
 
 void test_default_protocol_target_profiles_cover_mq_family() {
     const auto profiles = default_protocol_target_profiles();
-    expect(profiles.size() == 6, "expected six protocol target profiles");
+    expect(profiles.size() == 8, "expected protocol and field-I/O target profiles");
 
     bool saw_mqtt = false;
     bool saw_rmq = false;
@@ -449,6 +516,8 @@ void test_default_protocol_target_profiles_cover_mq_family() {
     bool saw_activemq = false;
     bool saw_asb = false;
     bool saw_kafka = false;
+    bool saw_com0com = false;
+    bool saw_field_serial = false;
 
     for (const auto& profile : profiles) {
         if (profile.label == "mqtt-broker" && profile.query.port == 1883) saw_mqtt = true;
@@ -457,6 +526,10 @@ void test_default_protocol_target_profiles_cover_mq_family() {
         if (profile.label == "activemq-broker" && profile.query.port == 61616) saw_activemq = true;
         if (profile.label == "azure-service-bus" && profile.query.port == 5671) saw_asb = true;
         if (profile.label == "kafka-broker" && profile.query.port == 9092) saw_kafka = true;
+        if (profile.label == "com0com-serial-pair" &&
+            profile.serial_ingress_device == "COM5" && profile.baud == 115200) saw_com0com = true;
+        if (profile.label == "field-serial-console" &&
+            profile.transport == "tcp-serial" && profile.listen_port == 17777) saw_field_serial = true;
     }
 
     expect(saw_mqtt, "missing mqtt profile");
@@ -465,6 +538,47 @@ void test_default_protocol_target_profiles_cover_mq_family() {
     expect(saw_activemq, "missing activemq profile");
     expect(saw_asb, "missing azure service bus profile");
     expect(saw_kafka, "missing kafka profile");
+    expect(saw_com0com, "missing com0com serial profile");
+    expect(saw_field_serial, "missing field serial profile");
+}
+
+void test_micro_capture_connack_hex_and_pcap() {
+    const std::string capture_path = "/tmp/ghostline_micro_capture_test.glcap";
+    const std::string pcap_path = "/tmp/ghostline_micro_capture_test.pcap";
+    std::filesystem::remove(capture_path);
+    std::filesystem::remove(pcap_path);
+
+    const ByteVec connack{0x20, 0x02, 0x00, 0x00};
+    const auto summary = mqtt_packet_summary(Direction::ServerToClient, connack);
+    expect(summary.find("MQTT CONNACK") != std::string::npos,
+           "expected CONNACK packet summary");
+    expect(summary.find("reason=success") != std::string::npos,
+           "expected CONNACK reason decoding");
+    expect(capture_hex_dump(bytes_from_ascii("AB")).find("41 42") != std::string::npos,
+           "expected terminal hex dump");
+
+    {
+        CaptureConfig config;
+        config.stream_path = capture_path;
+        config.pcap_path = pcap_path;
+        config.max_bytes = 128;
+        config.snaplen = 64;
+        config.expect_mqtt_connack = true;
+        MicroCapture capture(config);
+        capture.record(7, Direction::ServerToClient, "tcp", "mqtt", connack);
+        expect(capture.connack_seen(), "expected capture CONNACK state");
+        expect(capture.captured_bytes() == connack.size(), "expected capture byte accounting");
+    }
+
+    expect(std::filesystem::file_size(pcap_path) > 24,
+           "expected DLT_USER0 pcap records");
+    std::ostringstream rendered;
+    std::string error;
+    expect(render_capture_file(capture_path, rendered, 0, &error),
+           "expected readable GLCAP1 capture");
+    expect(rendered.str().find("MQTT CONNACK") != std::string::npos &&
+           rendered.str().find("20 02 00 00") != std::string::npos,
+           "expected CONNACK terminal capture rendering");
 }
 
 void test_review_queue_save_update_and_replay() {
@@ -508,6 +622,9 @@ int main() {
     try {
         test_byte_window_plugin_releases_modified();
         test_observation_plugin_stays_passive();
+        test_amqp_observation_plugin_frames_protocol_and_method_frames();
+        test_kafka_observation_plugin_frames_length_prefix();
+        test_amqp10_observation_plugin_frames_performative();
         test_size_mutation_requires_safe_rewrite();
         test_protocol_hint_selects_requested_plugin();
         test_all_named_plugins_are_registered();
@@ -525,6 +642,7 @@ int main() {
         test_pid_search_json_contains_core_fields();
         test_target_profile_save_and_load();
         test_default_protocol_target_profiles_cover_mq_family();
+        test_micro_capture_connack_hex_and_pcap();
         test_review_queue_save_update_and_replay();
     } catch (const std::exception& error) {
         std::cerr << "ghostline_tests failed: " << error.what() << "\n";

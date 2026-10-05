@@ -1,6 +1,7 @@
 #include "net/proxy.hpp"
 
 #include "ghostline/audit.hpp"
+#include "ghostline/capture.hpp"
 #include "ghostline/operator_state.hpp"
 #include "ghostline/plugin.hpp"
 
@@ -58,6 +59,8 @@ struct PeerState {
     bool plugin_logged = false;
     std::string plugin_name;
     ByteVec pending;
+    ByteVec trace_tail;
+    bool trace_logged = false;
     std::deque<ByteVec> outq;
 };
 
@@ -169,6 +172,39 @@ std::size_t find_subsequence(const ByteVec& haystack, const ByteVec& needle, std
         }
     }
     return std::string::npos;
+}
+
+ByteVec decode_hex_bytes(const std::string& input, const std::string& label) {
+    ByteVec output;
+    std::string compact;
+    for (const char ch : input) {
+        if (!std::isspace(static_cast<unsigned char>(ch))) compact.push_back(ch);
+    }
+    if (compact.empty()) return output;
+    if (compact.size() % 2 != 0) {
+        throw std::runtime_error(label + " must have an even number of characters");
+    }
+    for (std::size_t index = 0; index < compact.size(); index += 2) {
+        const std::string octet = compact.substr(index, 2);
+        std::size_t consumed = 0;
+        const unsigned long value = std::stoul(octet, &consumed, 16);
+        if (consumed != 2 || value > 255) throw std::runtime_error(label + " contains invalid hexadecimal bytes");
+        output.push_back(static_cast<byte>(value));
+    }
+    return output;
+}
+
+bool trace_matches(PeerState& peer, const ByteVec& signature, const ByteVec& bytes) {
+    if (signature.empty() || peer.trace_logged) return false;
+    ByteVec window;
+    window.reserve(peer.trace_tail.size() + bytes.size());
+    window.insert(window.end(), peer.trace_tail.begin(), peer.trace_tail.end());
+    window.insert(window.end(), bytes.begin(), bytes.end());
+    const bool matched = find_subsequence(window, signature, 0) != std::string::npos;
+    const std::size_t keep = signature.size() > 1 ? std::min(signature.size() - 1, window.size()) : 0;
+    peer.trace_tail.assign(window.end() - static_cast<long>(keep), window.end());
+    if (matched) peer.trace_logged = true;
+    return matched;
 }
 
 void enqueue_bytes(std::deque<ByteVec>& outq, const ByteVec& bytes) {
@@ -525,25 +561,8 @@ bool flow_finished(const FlowState& flow) {
 MutationConfig make_mutation_config(const ProxyConfig& cfg) {
     MutationConfig config;
 
-    auto decode_hex = [](const std::string& input) -> ByteVec {
-        ByteVec out;
-        std::string compact;
-        for (std::size_t i = 0; i < input.size(); ++i) {
-            const char ch = input[i];
-            if (!std::isspace(static_cast<unsigned char>(ch))) compact.push_back(ch);
-        }
-        if (compact.empty()) return out;
-        if (compact.size() % 2 != 0) {
-            throw std::runtime_error("marker hex must have an even number of characters");
-        }
-        for (std::size_t i = 0; i < compact.size(); i += 2) {
-            out.push_back(static_cast<byte>(std::stoul(compact.substr(i, 2), nullptr, 16)));
-        }
-        return out;
-    };
-
-    config.start_marker = decode_hex(cfg.start_marker_hex);
-    config.end_marker = decode_hex(cfg.end_marker_hex);
+    config.start_marker = decode_hex_bytes(cfg.start_marker_hex, "marker hex");
+    config.end_marker = decode_hex_bytes(cfg.end_marker_hex, "marker hex");
     config.replacement_text = cfg.replacement_text;
     config.raw_find_text = cfg.raw_find_text;
     config.allow_size_mutation = cfg.allow_size_mutation;
@@ -561,6 +580,22 @@ MutationConfig make_mutation_config(const ProxyConfig& cfg) {
 } // namespace
 
 int run_transport_core(const ProxyConfig& cfg) {
+    if (!cfg.trace_text.empty() && !cfg.trace_hex.empty()) {
+        std::fprintf(stderr, "Configure one trace signature: --trace-text or --trace-hex\n");
+        return 2;
+    }
+    ByteVec trace_signature(cfg.trace_text.begin(), cfg.trace_text.end());
+    try {
+        if (!cfg.trace_hex.empty()) trace_signature = decode_hex_bytes(cfg.trace_hex, "trace hex");
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "Invalid trace signature: %s\n", error.what());
+        return 2;
+    }
+    if (cfg.cut_on_trace && trace_signature.empty()) {
+        std::fprintf(stderr, "--cut-on-trace requires --trace-text or --trace-hex\n");
+        return 2;
+    }
+
     const int listen_fd = create_listen_socket(cfg.listen_host, cfg.listen_port);
     if (listen_fd < 0) {
         std::fprintf(stderr, "Failed to create listen socket on %s:%u\n", cfg.listen_host.c_str(), static_cast<unsigned>(cfg.listen_port));
@@ -573,6 +608,15 @@ int run_transport_core(const ProxyConfig& cfg) {
                      cfg.audit_json_path,
                      cfg.action_json_path,
                      cfg.review_queue_dir);
+
+    CaptureConfig capture_config;
+    capture_config.stream_path = cfg.capture_path;
+    capture_config.pcap_path = cfg.capture_pcap_path;
+    capture_config.max_bytes = cfg.capture_max_bytes;
+    capture_config.snaplen = cfg.capture_snaplen;
+    capture_config.print_hex = cfg.capture_hex;
+    capture_config.expect_mqtt_connack = cfg.expect_mqtt_connack;
+    MicroCapture capture(capture_config);
 
     std::unordered_map<std::uint32_t, FlowState> flows;
     std::unordered_map<int, FdContext> fd_contexts;
@@ -646,6 +690,11 @@ int run_transport_core(const ProxyConfig& cfg) {
                     FlowState flow;
                     flow.context.flow_id = next_flow_id++;
                     flow.context.preferred_plugin = cfg.protocol_hint;
+                    flow.context.observe_only = cfg.observe_only;
+                    if (cfg.observe_only) {
+                        flow.context.observe_reason = "operator forced observe-only mode";
+                        flow.context.flags.push_back(FlowFlag::ObserveOnly);
+                    }
                     flow.client.fd = client_fd;
                     flow.upstream.fd = upstream_fd;
                     flow.upstream.connecting = connecting;
@@ -664,6 +713,7 @@ int run_transport_core(const ProxyConfig& cfg) {
             if (flow_it == flows.end()) continue;
 
             FlowState& flow = flow_it->second;
+            const std::uint32_t active_flow_id = flow.context.flow_id;
             PeerState& src = ctx_it->second.is_client ? flow.client : flow.upstream;
             PeerState& dst = ctx_it->second.is_client ? flow.upstream : flow.client;
             const Direction direction = ctx_it->second.is_client ? Direction::ClientToServer : Direction::ServerToClient;
@@ -684,9 +734,34 @@ int run_transport_core(const ProxyConfig& cfg) {
             }
 
             if ((pfd.revents & POLLIN) && src.read_open) {
+                bool cut_flow = false;
                 while (true) {
                     const ssize_t received = ::recv(src.fd, read_buffer.data(), read_buffer.size(), 0);
                     if (received > 0) {
+                        const ByteVec captured(
+                            read_buffer.begin(), read_buffer.begin() + received);
+                        capture.record(flow.context.flow_id, direction, "tcp",
+                                       cfg.protocol_hint, captured);
+                        const bool trace_direction_enabled = direction == Direction::ClientToServer
+                            ? cfg.trace_client_to_server : cfg.trace_server_to_client;
+                        if (trace_direction_enabled && trace_matches(src, trace_signature, captured)) {
+                            ++flow.context.event_sequence;
+                            record_protocol_event(audit,
+                                                  flow.context,
+                                                  direction,
+                                                  "trace-guard",
+                                                  cfg.cut_on_trace ? "containment-stream-cut" : "trace-match",
+                                                  cfg.cut_on_trace
+                                                      ? "classified byte trace matched; both flow directions closed"
+                                                      : "classified byte trace matched; observation continued",
+                                                  captured,
+                                                  ByteVec());
+                            if (cfg.cut_on_trace) {
+                                close_flow(flows, fd_contexts, active_flow_id);
+                                cut_flow = true;
+                                break;
+                            }
+                        }
                         src.pending.insert(src.pending.end(), read_buffer.begin(), read_buffer.begin() + received);
                         process_pending(flow, src, dst, direction, cfg, registry, audit);
                         continue;
@@ -703,6 +778,7 @@ int run_transport_core(const ProxyConfig& cfg) {
                     close_flow(flows, fd_contexts, flow.context.flow_id);
                     break;
                 }
+                if (cut_flow) continue;
             }
 
             if ((pfd.revents & POLLOUT) && !src.outq.empty()) {

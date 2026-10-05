@@ -10,6 +10,26 @@ struct TargetProfile {
     std::string label;
     PidSearchQuery query;
     std::vector<ProcessSocketEntry> matches;
+    std::string transport = "tcp";
+    std::string listen_host = "127.0.0.1";
+    std::int32_t listen_port = 7777;
+    std::string upstream_host = "127.0.0.1";
+    std::int32_t upstream_port = 8888;
+    std::string serial_ingress_device;
+    std::string serial_device;
+    std::int32_t ingress_baud = 115200;
+    std::int32_t baud = 115200;
+    std::int32_t data_bits = 8;
+    std::int32_t stop_bits = 1;
+    std::string parity = "none";
+    std::string flow_control = "none";
+    std::string protocol_hint;
+    bool observe_only = true;
+    bool expect_connack = false;
+    std::string capture_path;
+    std::string capture_pcap_path;
+    std::size_t capture_max_bytes = 4U * 1024U * 1024U;
+    std::size_t capture_snaplen = 1024;
 };
 
 std::string bytes_to_hex_string(const ByteVec& bytes);

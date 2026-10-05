@@ -31,6 +31,29 @@ struct ProxyConfig {
     std::size_t mqtt_review_threshold_bytes = 0;
     std::size_t byte_window_review_threshold_bytes = 0;
     std::string protocol_hint;
+    bool observe_only = false;
+
+    std::string serial_device;
+    std::string serial_ingress_device;
+    int baud = 115200;
+    int ingress_baud = 115200;
+    int data_bits = 8;
+    int stop_bits = 1;
+    std::string parity = "none";
+    std::string flow_control = "none";
+
+    std::string capture_path;
+    std::string capture_pcap_path;
+    std::size_t capture_max_bytes = 4U * 1024U * 1024U;
+    std::size_t capture_snaplen = 1024;
+    bool capture_hex = false;
+    bool expect_mqtt_connack = false;
+
+    std::string trace_text;
+    std::string trace_hex;
+    bool cut_on_trace = false;
+    bool trace_client_to_server = true;
+    bool trace_server_to_client = true;
 
     std::string audit_log_path = "ghostline_audit.log";
     std::string action_log_path = "ghostline_actions.log";
@@ -40,3 +63,4 @@ struct ProxyConfig {
 };
 
 int run_transport_core(const ProxyConfig& cfg);
+int run_serial_bridge(const ProxyConfig& cfg);

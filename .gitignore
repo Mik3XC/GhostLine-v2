@@ -4,6 +4,7 @@
 # CMake / build outputs
 /build/
 /build-local/
+/build-*/
 /cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
@@ -32,6 +33,10 @@ compile_commands.json
 /ghostline_review_queue/
 /ghostline_replays/
 /ghostline_target_profiles/
+/waykeeper/*
+*waykeeper*
+*-waykeeper*
+./way-keeper/*
 
 # Simulation outputs
 /sim-output/

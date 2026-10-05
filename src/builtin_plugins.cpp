@@ -379,6 +379,191 @@ private:
     std::string detail_;
 };
 
+enum class ObservationFraming {
+    Amqp091,
+    Amqp10,
+    Kafka,
+};
+
+std::uint32_t read_u32_be(const ByteVec& bytes, const std::size_t offset) {
+    return (static_cast<std::uint32_t>(bytes[offset]) << 24U)
+        | (static_cast<std::uint32_t>(bytes[offset + 1]) << 16U)
+        | (static_cast<std::uint32_t>(bytes[offset + 2]) << 8U)
+        | static_cast<std::uint32_t>(bytes[offset + 3]);
+}
+
+std::uint16_t read_u16_be(const ByteVec& bytes, const std::size_t offset) {
+    return static_cast<std::uint16_t>(
+        (static_cast<std::uint16_t>(bytes[offset]) << 8U)
+        | static_cast<std::uint16_t>(bytes[offset + 1]));
+}
+
+class FramedObservationPlugin : public ProtocolPlugin {
+public:
+    FramedObservationPlugin(std::string plugin_name,
+                            const std::uint16_t port_hint,
+                            std::string signature,
+                            std::string label,
+                            std::string detail,
+                            const ObservationFraming framing)
+        : plugin_name_(std::move(plugin_name)),
+          port_hint_(port_hint),
+          signature_(std::move(signature)),
+          label_(std::move(label)),
+          detail_(std::move(detail)),
+          framing_(framing) {}
+
+    std::string name() const override { return plugin_name_; }
+
+    bool matches(const FlowContext&, Direction, const std::uint16_t upstream_port, const ByteVec& buffer) const override {
+        return upstream_port == port_hint_ || (!signature_.empty() && starts_with(buffer, signature_.c_str()));
+    }
+
+    bool uses_protocol_framing() const override { return true; }
+
+    FramingResult frame(const FlowContext&, const Direction direction, const ByteVec& buffer) const override {
+        if (framing_ == ObservationFraming::Amqp091) return frame_amqp091(direction, buffer);
+        if (framing_ == ObservationFraming::Amqp10) return frame_amqp10(direction, buffer);
+        return frame_kafka(direction, buffer);
+    }
+
+    bool configure_window(const FlowContext&, Direction, WindowRule&) const override { return false; }
+
+    Candidate build_candidate(const FlowContext&, Direction, const ByteVec& window, const FramingResult* framed) const override {
+        Candidate candidate;
+        candidate.plugin_name = plugin_name_;
+        candidate.trigger_label = label_;
+        candidate.packet_type = framed == nullptr ? label_ : framed->packet_type;
+        candidate.original_bytes = window;
+        candidate.modified_bytes = window;
+        candidate.protocol_note = framed == nullptr ? detail_ : framed->detail;
+        candidate.note = detail_;
+        return candidate;
+    }
+
+    CandidateDecision decide(const FlowContext&, Direction, Candidate&) const override {
+        CandidateDecision decision;
+        decision.release = CandidateRelease::ReleaseOriginal;
+        decision.outcome = ValidationOutcome::ValidationFallbackOriginal;
+        decision.validation_label = "framed-observe-only";
+        decision.validation_detail = "bounded protocol frame was observed and retained unchanged";
+        decision.fallback_reason = "protocol mutation policy is not configured";
+        return decision;
+    }
+
+    std::string audit_label() const override { return label_; }
+
+private:
+    FramingResult need_more(const std::string& detail) const {
+        FramingResult result;
+        result.disposition = FramingDisposition::NeedMoreBytes;
+        result.detail = detail;
+        return result;
+    }
+
+    FramingResult failed(const std::string& detail) const {
+        FramingResult result;
+        result.disposition = FramingDisposition::FramingFailed;
+        result.detail = detail;
+        result.structural_risk = true;
+        return result;
+    }
+
+    FramingResult frame_amqp_header(const ByteVec& buffer) const {
+        if (buffer.size() < 8) return need_more("waiting for complete AMQP protocol header");
+        FramingResult result;
+        result.disposition = FramingDisposition::FramedPacket;
+        result.consumed_bytes = 8;
+        result.frame_bytes.assign(buffer.begin(), buffer.begin() + 8);
+        result.packet_type = "AMQP-PROTOCOL-HEADER";
+        result.detail = "AMQP protocol-id=" + std::to_string(buffer[4]) + " version="
+            + std::to_string(buffer[5]) + "." + std::to_string(buffer[6]) + "." + std::to_string(buffer[7]);
+        return result;
+    }
+
+    FramingResult frame_amqp091(const Direction, const ByteVec& buffer) const {
+        if (buffer.size() < 7) return need_more("waiting for AMQP header or frame header");
+        if (starts_with(buffer, "AMQP")) return frame_amqp_header(buffer);
+
+        const std::uint32_t payload_size = read_u32_be(buffer, 3);
+        constexpr std::uint32_t hard_frame_ceiling = 16U * 1024U * 1024U;
+        if (payload_size > hard_frame_ceiling) return failed("AMQP frame exceeds hard structural ceiling");
+        const std::size_t total = 7U + static_cast<std::size_t>(payload_size) + 1U;
+        if (buffer.size() < total) return need_more("waiting for complete AMQP 0-9-1 frame");
+        if (buffer[total - 1] != 0xceU) return failed("AMQP frame-end octet is not 0xCE");
+
+        static const char* types[] = {"UNKNOWN", "METHOD", "HEADER", "BODY", "HEARTBEAT"};
+        const byte type = buffer[0];
+        FramingResult result;
+        result.disposition = FramingDisposition::FramedPacket;
+        result.consumed_bytes = total;
+        result.frame_bytes.assign(buffer.begin(), buffer.begin() + static_cast<long>(total));
+        result.packet_type = type <= 4 ? std::string("AMQP-") + types[type] : "AMQP-TYPE-" + std::to_string(type);
+        result.detail = "AMQP frame channel=" + std::to_string(read_u16_be(buffer, 1))
+            + " payload-bytes=" + std::to_string(payload_size);
+        return result;
+    }
+
+    FramingResult frame_amqp10(const Direction, const ByteVec& buffer) const {
+        if (buffer.size() < 8) return need_more("waiting for AMQP 1.0 protocol or frame header");
+        if (starts_with(buffer, "AMQP")) return frame_amqp_header(buffer);
+
+        const std::uint32_t frame_size = read_u32_be(buffer, 0);
+        constexpr std::uint32_t hard_frame_ceiling = 16U * 1024U * 1024U;
+        if (frame_size < 8 || frame_size > hard_frame_ceiling) {
+            return failed("AMQP 1.0 frame size is outside structural bounds");
+        }
+        const std::size_t header_size = static_cast<std::size_t>(buffer[4]) * 4U;
+        if (header_size < 8 || header_size > frame_size) {
+            return failed("AMQP 1.0 data offset is outside frame bounds");
+        }
+        if (buffer.size() < frame_size) return need_more("waiting for complete AMQP 1.0 frame");
+
+        FramingResult result;
+        result.disposition = FramingDisposition::FramedPacket;
+        result.consumed_bytes = frame_size;
+        result.frame_bytes.assign(buffer.begin(), buffer.begin() + static_cast<long>(frame_size));
+        result.packet_type = buffer[5] == 0 ? "AMQP10-FRAME" : buffer[5] == 1 ? "AMQP10-SASL" : "AMQP10-TYPE-" + std::to_string(buffer[5]);
+        result.detail = "AMQP 1.0 frame channel=" + std::to_string(read_u16_be(buffer, 6))
+            + " header-bytes=" + std::to_string(header_size)
+            + " frame-bytes=" + std::to_string(frame_size);
+        return result;
+    }
+
+    FramingResult frame_kafka(const Direction direction, const ByteVec& buffer) const {
+        if (buffer.size() < 4) return need_more("waiting for Kafka length prefix");
+        const std::uint32_t body_size = read_u32_be(buffer, 0);
+        constexpr std::uint32_t hard_frame_ceiling = 100U * 1024U * 1024U;
+        if (body_size == 0 || body_size > hard_frame_ceiling) return failed("Kafka frame length is outside structural bounds");
+        const std::size_t total = 4U + static_cast<std::size_t>(body_size);
+        if (buffer.size() < total) return need_more("waiting for complete Kafka request or response frame");
+
+        FramingResult result;
+        result.disposition = FramingDisposition::FramedPacket;
+        result.consumed_bytes = total;
+        result.frame_bytes.assign(buffer.begin(), buffer.begin() + static_cast<long>(total));
+        if (direction == Direction::ClientToServer && body_size >= 8) {
+            result.packet_type = "KAFKA-REQUEST";
+            result.detail = "Kafka request api-key=" + std::to_string(read_u16_be(buffer, 4))
+                + " api-version=" + std::to_string(read_u16_be(buffer, 6))
+                + " correlation-id=" + std::to_string(read_u32_be(buffer, 8));
+        } else {
+            result.packet_type = "KAFKA-RESPONSE";
+            result.detail = body_size >= 4
+                ? "Kafka response correlation-id=" + std::to_string(read_u32_be(buffer, 4))
+                : "Kafka response frame";
+        }
+        return result;
+    }
+
+    std::string plugin_name_;
+    std::uint16_t port_hint_;
+    std::string signature_;
+    std::string label_;
+    std::string detail_;
+    ObservationFraming framing_;
+};
+
 struct MqttFrameInfo {
     bool valid = false;
     byte first_byte = 0;
@@ -730,10 +915,16 @@ std::vector<std::unique_ptr<ProtocolPlugin>> make_builtin_plugins(const Mutation
     plugins.emplace_back(new RawLivePlugin(config));
     plugins.emplace_back(new ByteWindowPlugin(config));
     plugins.emplace_back(new MqttPlugin(config));
-    plugins.emplace_back(new ObservationPlugin("rabbitmq", 5672, "AMQP", "amqp-0-9-1", "rabbitmq observe-only protocol plugin"));
+    plugins.emplace_back(new FramedObservationPlugin("rabbitmq", 5672, "AMQP", "amqp-0-9-1",
+                                                      "rabbitmq AMQP 0-9-1 framed observation plugin",
+                                                      ObservationFraming::Amqp091));
     plugins.emplace_back(new ObservationPlugin("activemq", 61616, "", "activemq-openwire", "activemq observe-only protocol plugin"));
-    plugins.emplace_back(new ObservationPlugin("amqp", 5672, "AMQP", "amqp-generic", "generic amqp observe-only protocol plugin"));
+    plugins.emplace_back(new FramedObservationPlugin("amqp", 5672, "AMQP", "amqp-generic",
+                                                      "generic AMQP 1.0 framed observation plugin",
+                                                      ObservationFraming::Amqp10));
     plugins.emplace_back(new ObservationPlugin("azure-service-bus", 5671, "", "azure-service-bus", "azure service bus observe-only protocol plugin"));
-    plugins.emplace_back(new ObservationPlugin("kafka", 9092, "", "kafka", "kafka observe-only protocol plugin"));
+    plugins.emplace_back(new FramedObservationPlugin("kafka", 9092, "", "kafka",
+                                                      "kafka length-framed observation plugin",
+                                                      ObservationFraming::Kafka));
     return plugins;
 }

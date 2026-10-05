@@ -189,6 +189,26 @@ void save_target_profile(const std::string& path, const TargetProfile& profile) 
         << ",\"state\":\"" << json_escape(profile.query.state) << "\""
         << ",\"listen_only\":" << (profile.query.listen_only ? "true" : "false")
         << ",\"established_only\":" << (profile.query.established_only ? "true" : "false")
+        << ",\"transport\":\"" << json_escape(profile.transport) << "\""
+        << ",\"listen_host\":\"" << json_escape(profile.listen_host) << "\""
+        << ",\"listen_port\":" << profile.listen_port
+        << ",\"upstream_host\":\"" << json_escape(profile.upstream_host) << "\""
+        << ",\"upstream_port\":" << profile.upstream_port
+        << ",\"serial_ingress_device\":\"" << json_escape(profile.serial_ingress_device) << "\""
+        << ",\"serial_device\":\"" << json_escape(profile.serial_device) << "\""
+        << ",\"ingress_baud\":" << profile.ingress_baud
+        << ",\"baud\":" << profile.baud
+        << ",\"data_bits\":" << profile.data_bits
+        << ",\"stop_bits\":" << profile.stop_bits
+        << ",\"parity\":\"" << json_escape(profile.parity) << "\""
+        << ",\"flow_control\":\"" << json_escape(profile.flow_control) << "\""
+        << ",\"protocol_hint\":\"" << json_escape(profile.protocol_hint) << "\""
+        << ",\"observe_only\":" << (profile.observe_only ? "true" : "false")
+        << ",\"expect_connack\":" << (profile.expect_connack ? "true" : "false")
+        << ",\"capture_path\":\"" << json_escape(profile.capture_path) << "\""
+        << ",\"capture_pcap_path\":\"" << json_escape(profile.capture_pcap_path) << "\""
+        << ",\"capture_max_bytes\":" << profile.capture_max_bytes
+        << ",\"capture_snaplen\":" << profile.capture_snaplen
         << ",\"query\":" << query_to_json(profile.query)
         << ",\"matches\":" << matches_to_json(profile.matches)
         << "}\n";
@@ -205,6 +225,31 @@ TargetProfile load_target_profile(const std::string& path) {
     profile.query.state = extract_string_field(text, "state");
     profile.query.listen_only = extract_bool_field(text, "listen_only", false);
     profile.query.established_only = extract_bool_field(text, "established_only", false);
+    profile.transport = extract_string_field(text, "transport");
+    if (profile.transport.empty()) profile.transport = "tcp";
+    profile.listen_host = extract_string_field(text, "listen_host");
+    if (profile.listen_host.empty()) profile.listen_host = "127.0.0.1";
+    profile.listen_port = static_cast<std::int32_t>(extract_integer_field(text, "listen_port", 7777));
+    profile.upstream_host = extract_string_field(text, "upstream_host");
+    if (profile.upstream_host.empty()) profile.upstream_host = "127.0.0.1";
+    profile.upstream_port = static_cast<std::int32_t>(extract_integer_field(text, "upstream_port", 8888));
+    profile.serial_ingress_device = extract_string_field(text, "serial_ingress_device");
+    profile.serial_device = extract_string_field(text, "serial_device");
+    profile.ingress_baud = static_cast<std::int32_t>(extract_integer_field(text, "ingress_baud", 115200));
+    profile.baud = static_cast<std::int32_t>(extract_integer_field(text, "baud", 115200));
+    profile.data_bits = static_cast<std::int32_t>(extract_integer_field(text, "data_bits", 8));
+    profile.stop_bits = static_cast<std::int32_t>(extract_integer_field(text, "stop_bits", 1));
+    profile.parity = extract_string_field(text, "parity");
+    if (profile.parity.empty()) profile.parity = "none";
+    profile.flow_control = extract_string_field(text, "flow_control");
+    if (profile.flow_control.empty()) profile.flow_control = "none";
+    profile.protocol_hint = extract_string_field(text, "protocol_hint");
+    profile.observe_only = extract_bool_field(text, "observe_only", true);
+    profile.expect_connack = extract_bool_field(text, "expect_connack", false);
+    profile.capture_path = extract_string_field(text, "capture_path");
+    profile.capture_pcap_path = extract_string_field(text, "capture_pcap_path");
+    profile.capture_max_bytes = static_cast<std::size_t>(extract_integer_field(text, "capture_max_bytes", 4U * 1024U * 1024U));
+    profile.capture_snaplen = static_cast<std::size_t>(extract_integer_field(text, "capture_snaplen", 1024));
     return profile;
 }
 
@@ -233,6 +278,26 @@ std::string target_profile_to_json(const TargetProfile& profile) {
         << ",\"state\":\"" << json_escape(profile.query.state) << "\""
         << ",\"listen_only\":" << (profile.query.listen_only ? "true" : "false")
         << ",\"established_only\":" << (profile.query.established_only ? "true" : "false")
+        << ",\"transport\":\"" << json_escape(profile.transport) << "\""
+        << ",\"listen_host\":\"" << json_escape(profile.listen_host) << "\""
+        << ",\"listen_port\":" << profile.listen_port
+        << ",\"upstream_host\":\"" << json_escape(profile.upstream_host) << "\""
+        << ",\"upstream_port\":" << profile.upstream_port
+        << ",\"serial_ingress_device\":\"" << json_escape(profile.serial_ingress_device) << "\""
+        << ",\"serial_device\":\"" << json_escape(profile.serial_device) << "\""
+        << ",\"ingress_baud\":" << profile.ingress_baud
+        << ",\"baud\":" << profile.baud
+        << ",\"data_bits\":" << profile.data_bits
+        << ",\"stop_bits\":" << profile.stop_bits
+        << ",\"parity\":\"" << json_escape(profile.parity) << "\""
+        << ",\"flow_control\":\"" << json_escape(profile.flow_control) << "\""
+        << ",\"protocol_hint\":\"" << json_escape(profile.protocol_hint) << "\""
+        << ",\"observe_only\":" << (profile.observe_only ? "true" : "false")
+        << ",\"expect_connack\":" << (profile.expect_connack ? "true" : "false")
+        << ",\"capture_path\":\"" << json_escape(profile.capture_path) << "\""
+        << ",\"capture_pcap_path\":\"" << json_escape(profile.capture_pcap_path) << "\""
+        << ",\"capture_max_bytes\":" << profile.capture_max_bytes
+        << ",\"capture_snaplen\":" << profile.capture_snaplen
         << ",\"query\":" << query_to_json(profile.query)
         << ",\"matches\":" << matches_to_json(profile.matches)
         << "}";
@@ -253,6 +318,13 @@ std::vector<TargetProfile> default_protocol_target_profiles() {
         profile.query.port = port;
         profile.query.state = state;
         profile.query.listen_only = listen_only;
+        profile.upstream_port = port;
+        profile.listen_port = port == 1883 ? 11883 : port + 10000;
+        profile.observe_only = true;
+        profile.protocol_hint = label == "mqtt-broker" ? "mqtt" : std::string();
+        profile.expect_connack = label == "mqtt-broker";
+        profile.capture_path = label + ".glcap";
+        profile.capture_pcap_path = label + ".pcap";
         profiles.push_back(profile);
     };
 
@@ -262,6 +334,31 @@ std::vector<TargetProfile> default_protocol_target_profiles() {
     add_profile("activemq-broker", "activemq", 61616);
     add_profile("azure-service-bus", "azure", 5671);
     add_profile("kafka-broker", "kafka", 9092);
+
+    TargetProfile com0com;
+    com0com.label = "com0com-serial-pair";
+    com0com.transport = "serial-pair";
+    com0com.serial_ingress_device = "COM5";
+    com0com.serial_device = "COM6";
+    com0com.ingress_baud = 115200;
+    com0com.baud = 115200;
+    com0com.protocol_hint = "raw-live";
+    com0com.observe_only = true;
+    com0com.capture_path = "com0com-serial-pair.glcap";
+    com0com.capture_pcap_path = "com0com-serial-pair.pcap";
+    profiles.push_back(com0com);
+
+    TargetProfile field_serial;
+    field_serial.label = "field-serial-console";
+    field_serial.transport = "tcp-serial";
+    field_serial.listen_port = 17777;
+    field_serial.serial_device = "/dev/ttyWK0";
+    field_serial.baud = 115200;
+    field_serial.protocol_hint = "raw-live";
+    field_serial.observe_only = true;
+    field_serial.capture_path = "field-serial-console.glcap";
+    field_serial.capture_pcap_path = "field-serial-console.pcap";
+    profiles.push_back(field_serial);
 
     return profiles;
 }
