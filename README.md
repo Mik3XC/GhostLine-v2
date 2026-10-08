@@ -1,5 +1,5 @@
-`### > Disclaimer:`
-- I am not responsible for misuse of the local example. Also, the editor has not been tested yet.
+### > Disclaimer:
+`I am not responsible for misuse of the local example. Also, the editor has not been tested yet.`
 
 # Ghostline Gate
 
