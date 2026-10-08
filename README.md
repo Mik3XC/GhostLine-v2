@@ -1,3 +1,6 @@
+`### > Disclaimer:`
+- I am not responsible for misuse of the local example. Also, the editor has not been tested yet.
+
 # Ghostline Gate
 
 Ghostline Gate is an inline transport workbench for traffic deliberately routed
